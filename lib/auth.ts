@@ -24,6 +24,8 @@ export type AuthSession = {
   isOwner: boolean;
   permissions: Permission[];
   csrfToken: string;
+  expiresAt: string;
+  idleExpiresAt: string;
 };
 
 export type StaffAccount = {
@@ -57,7 +59,7 @@ const GOOGLE_JWKS = createRemoteJWKSet(new URL("https://www.googleapis.com/oauth
 const permissionsByRole: Record<StaffRole, Permission[]> = {
   viewer: ["view"],
   operator: ["view", "operate"],
-  admin: ["view", "operate", "configure"],
+  admin: ["view", "operate", "configure", "manage_access"],
 };
 
 const authSchema = [
@@ -274,6 +276,8 @@ function sessionFromRow(row: SessionRow, rawToken: string): AuthSession {
     isOwner,
     permissions,
     csrfToken: csrfForToken(rawToken),
+    expiresAt: row.absolute_expires_at,
+    idleExpiresAt: new Date(Date.parse(row.last_seen_at) + IDLE_MINUTES * 60 * 1000).toISOString(),
   };
 }
 
@@ -304,7 +308,7 @@ function getSessionRow(tokenHash: string): SessionRow | null {
     .first<SessionRow>();
 }
 
-export function currentSession(request: Request): AuthSession | null {
+export function currentSession(request: Request, options: { touch?: boolean } = {}): AuthSession | null {
   ensureAuthSchema();
   assertExpectedHost(request);
   const token = cookieValue(request, cookieName());
@@ -320,10 +324,29 @@ export function currentSession(request: Request): AuthSession | null {
     return null;
   }
 
-  if (now - Date.parse(row.last_seen_at) > 5 * 60 * 1000) {
-    db().prepare("UPDATE auth_sessions SET last_seen_at = ? WHERE token_hash = ?").bind(new Date(now).toISOString(), tokenHash).run();
+  if (options.touch !== false && now - Date.parse(row.last_seen_at) > 5 * 60 * 1000) {
+    row.last_seen_at = new Date(now).toISOString();
+    db().prepare("UPDATE auth_sessions SET last_seen_at = ? WHERE token_hash = ?").bind(row.last_seen_at, tokenHash).run();
   }
   return sessionFromRow(row, token);
+}
+
+export function extendSession(request: Request): { session: AuthSession; cookie: string } {
+  const active = requireSession(request, "view");
+  const token = cookieValue(request, cookieName());
+  if (!token) throw new HttpError(401, "Sign in required");
+  const now = new Date();
+  const expires = new Date(now.getTime() + SESSION_HOURS * 60 * 60 * 1000);
+  db().prepare("UPDATE auth_sessions SET last_seen_at = ?, absolute_expires_at = ? WHERE token_hash = ?")
+    .bind(now.toISOString(), expires.toISOString(), sha256(token))
+    .run();
+  const row = getSessionRow(sha256(token));
+  if (!row) throw new HttpError(401, "Sign in required");
+  addAuthAudit(active.actor, "authentication.session_extended");
+  return {
+    session: sessionFromRow(row, token),
+    cookie: cookieHeader(cookieName(), token, SESSION_HOURS * 60 * 60),
+  };
 }
 
 export function requireSession(request: Request, permission: Permission = "view"): AuthSession {

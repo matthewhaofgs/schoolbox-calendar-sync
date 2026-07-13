@@ -18,6 +18,8 @@ type AuthSession = {
   isOwner: boolean;
   permissions: Permission[];
   csrfToken: string;
+  expiresAt: string;
+  idleExpiresAt: string;
 };
 
 type AuthReadiness = { localAdministrator: boolean; googleSignInConfigured: boolean };
@@ -129,6 +131,8 @@ function normaliseRuns(value: unknown): Run[] | null {
 }
 
 let activeCsrfToken = "";
+const UNAUTHORIZED_EVENT = "relay:unauthorized";
+const SESSION_WARNING_MS = 5 * 60 * 1000;
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -142,7 +146,12 @@ async function fetchJson(url: string, init?: RequestInit) {
   if (!["GET", "HEAD", "OPTIONS"].includes(method) && activeCsrfToken) headers["X-CSRF-Token"] = activeCsrfToken;
   const response = await fetch(url, { ...init, credentials: "same-origin", headers: { ...headers, ...(init?.headers ?? {}) } });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new ApiError((data as { error?: string }).error || `Request failed (${response.status})`, response.status);
+  if (!response.ok) {
+    if (response.status === 401 && url !== "/api/auth/login" && typeof window !== "undefined") {
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    }
+    throw new ApiError((data as { error?: string }).error || `Request failed (${response.status})`, response.status);
+  }
   return data as Record<string, unknown>;
 }
 
@@ -164,6 +173,9 @@ export default function Home() {
   const [health, setHealth] = useState("Setup required");
   const [counts, setCounts] = useState<{ users: number; enabled: number; disabled: number; healthy: number; errors: number; unmatched: number; events: number } | null>(null);
   const [resourceErrors, setResourceErrors] = useState({ people: false, runs: false });
+  const [loginMessage, setLoginMessage] = useState("");
+  const [sessionClock, setSessionClock] = useState(() => Date.now());
+  const [extendingSession, setExtendingSession] = useState(false);
   const [config, setConfig] = useState({
     schoolboxUrl: "",
     schoolboxJwt: "",
@@ -182,10 +194,20 @@ export default function Home() {
   const canConfigure = Boolean(auth?.permissions.includes("configure"));
   const canManageAccess = Boolean(auth?.permissions.includes("manage_access"));
 
+  const expireSession = useCallback(() => {
+    activeCsrfToken = "";
+    setAuth(null);
+    setView("dashboard");
+    setLoginMessage("Your Relay session has expired. Sign in again to continue.");
+    window.history.replaceState({}, "", "/");
+  }, []);
+
   const acceptSession = useCallback((session: AuthSession) => {
     activeCsrfToken = session.csrfToken;
     setAuth(session);
     setView("dashboard");
+    setLoginMessage("");
+    setSessionClock(Date.now());
   }, []);
 
   useEffect(() => {
@@ -204,6 +226,44 @@ export default function Home() {
       .catch(() => { if (!cancelled) { setAuthUnavailable(true); setAuth(null); } });
     return () => { cancelled = true; };
   }, [acceptSession]);
+
+  useEffect(() => {
+    const handleUnauthorized = () => expireSession();
+    window.addEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
+  }, [expireSession]);
+
+  const authenticatedUserId = auth?.userId;
+  useEffect(() => {
+    if (!authenticatedUserId) return;
+    let cancelled = false;
+    const refreshSessionState = async () => {
+      try {
+        const payload = await fetchJson("/api/auth/session");
+        if (cancelled) return;
+        if (!payload.authenticated || !payload.session) {
+          expireSession();
+          return;
+        }
+        const session = payload.session as AuthSession;
+        activeCsrfToken = session.csrfToken;
+        setAuth(session);
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 401) return;
+      }
+    };
+    const timer = window.setInterval(() => void refreshSessionState(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [authenticatedUserId, expireSession]);
+
+  useEffect(() => {
+    if (!authenticatedUserId) return;
+    const timer = window.setInterval(() => setSessionClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [authenticatedUserId]);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -290,6 +350,13 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [notice]);
 
+  const sessionDeadlines = auth
+    ? [Date.parse(auth.expiresAt), Date.parse(auth.idleExpiresAt)].filter(Number.isFinite)
+    : [];
+  const sessionDeadline = sessionDeadlines.length ? Math.min(...sessionDeadlines) : Number.POSITIVE_INFINITY;
+  const sessionRemainingMs = sessionDeadline - sessionClock;
+  const showSessionWarning = Boolean(auth && Number.isFinite(sessionDeadline) && sessionRemainingMs <= SESSION_WARNING_MS);
+
   const changeView = (next: View) => {
     setView(next);
     setMobileNav(false);
@@ -352,12 +419,31 @@ export default function Home() {
     }
   };
 
+  const extendCurrentSession = async () => {
+    setExtendingSession(true);
+    try {
+      const payload = await fetchJson("/api/auth/session", { method: "POST", body: "{}" });
+      const session = payload.session as AuthSession;
+      activeCsrfToken = session.csrfToken;
+      setAuth(session);
+      setSessionClock(Date.now());
+      setNotice({ kind: "success", message: "Your Relay session has been extended." });
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 401) {
+        setNotice({ kind: "error", message: error instanceof Error ? error.message : "The session could not be extended." });
+      }
+    } finally {
+      setExtendingSession(false);
+    }
+  };
+
   const signOut = async () => {
     try {
       await fetchJson("/api/auth/logout", { method: "POST", body: "{}" });
       activeCsrfToken = "";
       setAuth(null);
       setView("dashboard");
+      setLoginMessage("");
     } catch (error) {
       setNotice({ kind: "error", message: error instanceof Error ? `Sign out failed: ${error.message}` : "Sign out failed. Try again." });
     }
@@ -366,15 +452,16 @@ export default function Home() {
     activeCsrfToken = "";
     setAuth(null);
     setView("dashboard");
+    setLoginMessage("Sign in again to continue.");
   }, []);
 
   if (auth === undefined) return <div className="auth-shell"><div className="auth-loading"><span className="brand-mark" aria-hidden="true"><i /><i /><i /></span><p>Starting Relay…</p></div></div>;
-  if (!auth) return <LoginScreen readiness={readiness} unavailable={authUnavailable} onAuthenticated={acceptSession} />;
+  if (!auth) return <LoginScreen readiness={readiness} unavailable={authUnavailable} message={loginMessage} onAuthenticated={acceptSession} />;
 
-  const title = { dashboard: "Calendar operations", setup: "Connection setup", people: "People & sync coverage", runs: "Runs & troubleshooting", settings: "Sync settings", access: "IT access" }[view];
+  const title = { dashboard: "Calendar operations", setup: configured ? "Connection status" : "Connection setup", people: "People & sync coverage", runs: "Runs & troubleshooting", settings: "Sync settings", access: "IT access" }[view];
   const subtitle = {
     dashboard: configured ? "Monitor Schoolbox calendar delivery across Google Workspace." : "Complete setup before discovering users and starting calendar sync.",
-    setup: "Connect both systems, grant access, then choose what Relay should sync.",
+    setup: configured ? "Setup is complete. Review the active connections or deliberately reopen the setup wizard." : "Connect both systems, grant access, then choose what Relay should sync.",
     people: "Review identity matches and choose whose calendars Relay maintains.",
     runs: "Inspect every sync and find the cause of exceptions.",
     settings: "Control schedule, calendar coverage and operational alerts.",
@@ -385,6 +472,7 @@ export default function Home() {
 
   return (
     <div className="app-shell">
+      {showSessionWarning && <div className="session-dialog-backdrop"><section className="session-dialog" role="dialog" aria-modal="true" aria-labelledby="session-dialog-title"><span className="session-dialog-icon">⌛</span><div><p className="eyebrow">Session expiring</p><h2 id="session-dialog-title">Stay signed in?</h2><p>Your Relay session will expire in about {Math.max(1, Math.ceil(sessionRemainingMs / 60_000))} minute{Math.ceil(sessionRemainingMs / 60_000) === 1 ? "" : "s"}. Extend it now to keep working.</p></div><div className="session-dialog-actions"><button className="button ghost" onClick={() => void signOut()} disabled={extendingSession}>Sign out</button><button className="button primary" onClick={() => void extendCurrentSession()} disabled={extendingSession}>{extendingSession ? "Extending…" : "Stay signed in"}</button></div></section></div>}
       <aside className={`sidebar ${mobileNav ? "sidebar-open" : ""}`}>
         <button className="brand" onClick={() => changeView("dashboard")} aria-label="Relay home">
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
@@ -393,7 +481,7 @@ export default function Home() {
         <nav aria-label="Main navigation">
           <p className="nav-label">Workspace</p>
           <NavButton active={view === "dashboard"} icon="⌂" label="Overview" onClick={() => changeView("dashboard")} />
-          {canConfigure && <NavButton active={view === "setup"} icon="↗" label="Setup" onClick={() => changeView("setup")} />}
+          {canConfigure && <NavButton active={view === "setup"} icon={configured ? "✓" : "↗"} label={configured ? "Setup complete" : "Setup"} onClick={() => changeView("setup")} />}
           <NavButton active={view === "people"} icon="◎" label="People" count={counts?.users ? String(counts.users) : undefined} onClick={() => changeView("people")} />
           <NavButton active={view === "runs"} icon="≡" label="Runs" onClick={() => changeView("runs")} />
           {canConfigure && <NavButton active={view === "settings"} icon="⚙" label="Settings" onClick={() => changeView("settings")} />}
@@ -418,18 +506,18 @@ export default function Home() {
 
           {notice && <div role="status" className={`notice ${notice.kind}`}><span>{notice.kind === "success" ? "✓" : notice.kind === "error" ? "!" : "i"}</span>{notice.message}<button onClick={() => setNotice(null)} aria-label="Dismiss notification">×</button></div>}
           {view === "dashboard" && <Dashboard people={people} runs={runs} counts={counts} lastSync={lastSync} health={health} apiOnline={apiOnline} configured={configured} config={config} runsError={resourceErrors.runs} onNavigate={changeView} onSelectRun={(run) => { setSelectedRun(run); setView("runs"); }} />}
-          {view === "setup" && canConfigure && <SetupWizard config={config} setConfig={setConfig} saveConfig={saveConfig} setNotice={setNotice} changeView={changeView} />}
+          {view === "setup" && canConfigure && <SetupWizard configured={configured} config={config} setConfig={setConfig} saveConfig={saveConfig} setNotice={setNotice} changeView={changeView} />}
           {view === "people" && <PeoplePage people={people} setPeople={setPeople} counts={counts} loadError={resourceErrors.people} canConfigure={canConfigure} setNotice={setNotice} />}
           {view === "runs" && <RunsPage runs={runs} selectedRun={selectedRun} setSelectedRun={setSelectedRun} runNow={runNow} syncRunning={syncRunning} canOperate={canOperate} loadError={resourceErrors.runs} />}
           {view === "settings" && canConfigure && <SettingsPage config={config} setConfig={setConfig} saveConfig={saveConfig} />}
-          {view === "access" && canManageAccess && <AccessPage setNotice={setNotice} onSignedOut={handleSignedOut} />}
+          {view === "access" && canManageAccess && <AccessPage canChangeLocalPassword={auth.isOwner && auth.authType === "local"} setNotice={setNotice} onSignedOut={handleSignedOut} />}
         </div>
       </main>
     </div>
   );
 }
 
-function LoginScreen({ readiness, unavailable, onAuthenticated }: { readiness: AuthReadiness; unavailable: boolean; onAuthenticated: (session: AuthSession) => void }) {
+function LoginScreen({ readiness, unavailable, message, onAuthenticated }: { readiness: AuthReadiness; unavailable: boolean; message: string; onAuthenticated: (session: AuthSession) => void }) {
   const [username, setUsername] = useState("administrator");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -461,6 +549,7 @@ function LoginScreen({ readiness, unavailable, onAuthenticated }: { readiness: A
       <p className="eyebrow">Internal administration</p>
       <h1>Sign in to Relay</h1>
       <p className="auth-intro">Use the break-glass administrator account, or sign in with an approved Google Workspace IT account.</p>
+      {message && <div className="auth-info" role="status"><span>i</span>{message}</div>}
       {unavailable && <div className="auth-error" role="alert"><span>!</span><div>Relay could not reach its authentication service. <button onClick={() => window.location.reload()}>Try again</button></div></div>}
       {(error || callbackError) && <div className="auth-error" role="alert"><span>!</span>{error || callbackError}</div>}
       {!unavailable && readiness.localAdministrator ? <form onSubmit={submit} className="auth-form">
@@ -468,7 +557,7 @@ function LoginScreen({ readiness, unavailable, onAuthenticated }: { readiness: A
         <Field label="Password"><input type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required /></Field>
         <button className="button primary full" type="submit" disabled={busy}>{busy ? "Signing in…" : "Sign in as local administrator"}<span>→</span></button>
       </form> : !unavailable && <div className="auth-setup"><b>Local administrator setup is required</b><p>On the server, run <code>npm run auth:bootstrap</code> before opening Relay to the IT network.</p></div>}
-      {!unavailable && readiness.googleSignInConfigured && <div className="oauth-choice"><span>or</span><a className="button google-signin" href="/api/auth/google/start"><b>G</b> Continue with Google Workspace</a><small>Only accounts pre-approved by the local administrator can enter.</small></div>}
+      {!unavailable && readiness.googleSignInConfigured && <div className="oauth-choice"><span>or</span><a className="button google-signin" href="/api/auth/google/start"><b>G</b> Continue with Google Workspace</a><small>Only accounts pre-approved by a Relay administrator can enter.</small></div>}
       <div className="auth-foot"><span>🔒</span><p>Self-hosted on your internal server. Sessions expire after 30 minutes of inactivity.</p></div>
     </div>
   </div>;
@@ -482,7 +571,7 @@ function Dashboard({ people, runs, counts, lastSync, health, apiOnline, configur
   const enabledPeople = people.filter(person => person.syncEnabled);
   const totalUsers = people.length ? enabledPeople.length : counts?.enabled ?? 0;
   const healthyUsers = people.length ? enabledPeople.filter(person => person.status === "Synced" || person.status === "Syncing").length : counts?.healthy ?? 0;
-  const issueUsers = people.length ? enabledPeople.filter(person => person.status === "Unmatched" || person.status === "Error").length : (counts?.errors ?? 0) + (counts?.unmatched ?? 0);
+  const unmatchedUsers = people.length ? people.filter(person => person.status === "Unmatched").length : counts?.unmatched ?? 0;
   const latestRun = runs[0];
   const activity = [...runs.slice(0, 7)].reverse();
   const activityMaximum = Math.max(1, ...activity.flatMap(run => [run.created ?? 0, run.updated ?? 0]));
@@ -500,7 +589,7 @@ function Dashboard({ people, runs, counts, lastSync, health, apiOnline, configur
       <Metric label="People in sync" value={healthyUsers.toLocaleString()} detail={totalUsers ? `of ${totalUsers.toLocaleString()} enabled` : people.length ? "No users enabled" : "No users discovered"} delta={totalUsers ? `${(healthyUsers / totalUsers * 100).toFixed(1)}%` : "—"} />
       <Metric label="Calendar items" value={(counts?.events ?? 0).toLocaleString()} detail="inside active window" delta="Managed by Relay" />
       <Metric label="Last run" value={latestRun?.duration ?? "—"} detail={latestRun ? `${latestRun.users.toLocaleString()} enabled people synced` : "No run recorded"} delta={latestRun?.status ?? "Waiting"} />
-      <Metric label="Needs attention" value={String(issueUsers)} detail="enabled people with errors" delta="Review" warning />
+      <Metric label="Unmatched" value={String(unmatchedUsers)} detail="Google accounts without an active Schoolbox match" delta="Informational" />
     </section>
 
     <section className="dashboard-grid">
@@ -540,7 +629,7 @@ function RunRow({ run, onClick }: { run: Run; onClick: () => void }) {
 }
 
 function StatusPill({ status }: { status: Person["status"] | Run["status"] }) {
-  const tone = status === "Succeeded" || status === "Synced" || status === "Syncing" ? "success" : status === "Failed" || status === "Unmatched" || status === "Error" ? "danger" : status === "Running" ? "info" : "warning";
+  const tone = status === "Succeeded" || status === "Synced" || status === "Syncing" ? "success" : status === "Failed" || status === "Error" ? "danger" : status === "Running" || status === "Unmatched" ? "info" : "warning";
   return <span className={`status-pill ${tone}`}><i />{status}</span>;
 }
 
@@ -558,12 +647,13 @@ type Config = {
   serviceAccountClientId: string;
 };
 
-function SetupWizard({ config, setConfig, saveConfig, setNotice, changeView }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; saveConfig: (message?: string) => Promise<boolean>; setNotice: (notice: Notice) => void; changeView: (view: View) => void }) {
+function SetupWizard({ configured, config, setConfig, saveConfig, setNotice, changeView }: { configured: boolean; config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; saveConfig: (message?: string) => Promise<boolean>; setNotice: (notice: Notice) => void; changeView: (view: View) => void }) {
   const [step, setStep] = useState(1);
   const [testing, setTesting] = useState<"schoolbox" | "google" | null>(null);
   const [schoolboxTested, setSchoolboxTested] = useState(false);
   const [googleTested, setGoogleTested] = useState(false);
   const [finished, setFinished] = useState(false);
+  const [editing, setEditing] = useState(false);
   const clientId = useMemo(() => {
     try { const parsed = JSON.parse(config.serviceAccountJson || "{}"); return String(parsed.client_id ?? config.serviceAccountClientId); } catch { return config.serviceAccountClientId; }
   }, [config.serviceAccountJson, config.serviceAccountClientId]);
@@ -602,6 +692,8 @@ function SetupWizard({ config, setConfig, saveConfig, setNotice, changeView }: {
   };
 
   if (finished) return <section className="setup-complete"><div className="completion-mark">✓</div><p className="eyebrow">Connections complete</p><h2>Relay is ready to move.</h2><p>Your settings are saved. The first run will discover everyone and sync only users enabled by your coverage policy.</p><div className="finish-summary"><span><b>Schoolbox</b><small>{config.schoolboxUrl}</small></span><span><b>Google Workspace</b><small>{config.adminEmail}</small></span><span><b>New users</b><small>{config.syncNewUsersByDefault ? "Enabled automatically" : "Paused for review"}</small></span></div><button className="button primary" onClick={() => changeView("dashboard")}>Go to overview <span>→</span></button></section>;
+
+  if (configured && !editing) return <section className="setup-complete configured-overview"><div className="completion-mark">✓</div><p className="eyebrow">Setup complete</p><h2>Relay is connected.</h2><p>The Schoolbox and Google Workspace connections are saved and active. Routine changes belong in Settings; reopen the setup wizard only when replacing credentials or delegation.</p><div className="finish-summary"><span><b>Schoolbox</b><small>{config.schoolboxUrl || "Connected"}</small></span><span><b>Google Workspace</b><small>{config.adminEmail || "Delegation configured"}</small></span><span><b>New users</b><small>{config.syncNewUsersByDefault ? "Enabled automatically" : "Paused for review"}</small></span></div><div className="configured-actions"><button className="button ghost" onClick={() => setEditing(true)}>Reopen setup wizard</button><button className="button secondary" onClick={() => changeView("settings")}>Open sync settings</button><button className="button primary" onClick={() => changeView("dashboard")}>Go to overview <span>→</span></button></div></section>;
 
   return <div className="setup-layout">
     <aside className="setup-steps" aria-label="Setup progress">
@@ -775,7 +867,7 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
     URL.revokeObjectURL(url);
   };
   return <>
-    <section className="people-summary"><div><span className="summary-icon green">#</span><p><b>{people.length || counts?.users || 0}</b><small>Discovered</small></p></div><div><span className="summary-icon green">✓</span><p><b>{enabledCount}</b><small>Enabled</small></p></div><div><span className="summary-icon amber">Ⅱ</span><p><b>{pausedCount}</b><small>Paused</small></p></div><div><span className="summary-icon red">!</span><p><b>{people.length ? people.filter(p => p.status === "Unmatched" || p.status === "Error").length : (counts?.unmatched ?? 0) + (counts?.errors ?? 0)}</b><small>Needs attention</small></p></div></section>
+    <section className="people-summary"><div><span className="summary-icon green">#</span><p><b>{people.length || counts?.users || 0}</b><small>Discovered</small></p></div><div><span className="summary-icon green">✓</span><p><b>{enabledCount}</b><small>Enabled</small></p></div><div><span className="summary-icon amber">Ⅱ</span><p><b>{pausedCount}</b><small>Paused</small></p></div><div><span className="summary-icon blue">○</span><p><b>{people.length ? people.filter(p => p.status === "Unmatched").length : counts?.unmatched ?? 0}</b><small>Unmatched</small></p></div></section>
     <section className="panel people-panel" aria-busy={busy}><div className="people-tools"><div className="search-box"><span aria-hidden="true">⌕</span><input value={query} onChange={e => { setQuery(e.target.value); setPage(0); setSelected(new Set()); }} placeholder="Search people or email…" aria-label="Search people" /></div><select value={coverageFilter} onChange={e => { setCoverageFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter calendar sync coverage"><option>All coverage</option><option>Enabled</option><option>Paused</option></select><select value={statusFilter} onChange={e => { setStatusFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter sync status"><option>All statuses</option><option>Synced</option><option>Syncing</option><option>Pending</option><option>Unmatched</option><option>Error</option></select><button className="button ghost" onClick={exportCsv}>Export CSV</button></div>
       {canConfigure && selectedVisible > 0 && <div className="people-bulk" role="status"><b>{selectedVisible} selected</b><span>Bulk changes apply only to the selected visible users.</span><button className="button secondary" onClick={() => void updateCoverage(selectedIds, true)} disabled={busy}>Enable selected</button><button className="button ghost" onClick={() => void updateCoverage(selectedIds, false)} disabled={busy}>Pause selected</button></div>}
       <div className="coverage-note"><span>i</span><p><b>Pausing stops future updates.</b> Existing Relay-created Google events stay in place until you use <strong>Remove Relay events</strong>. That cleanup uses Relay&apos;s event records and leaves every other calendar entry alone.</p></div>
@@ -817,7 +909,7 @@ function SettingsPage({ config, setConfig, saveConfig }: { config: Config; setCo
   </form></div>;
 }
 
-function AccessPage({ setNotice, onSignedOut }: { setNotice: (notice: Notice) => void; onSignedOut: () => void }) {
+function AccessPage({ canChangeLocalPassword, setNotice, onSignedOut }: { canChangeLocalPassword: boolean; setNotice: (notice: Notice) => void; onSignedOut: () => void }) {
   const [staff, setStaff] = useState<StaffAccount[]>([]);
   const [settings, setSettings] = useState<OAuthSettings | null>(null);
   const [oauthForm, setOauthForm] = useState({ clientId: "", clientSecret: "", workspaceDomain: "" });
@@ -922,7 +1014,7 @@ function AccessPage({ setNotice, onSignedOut }: { setNotice: (notice: Notice) =>
 
   return <div className="access-stack">
     <section className="panel access-panel">
-      <div className="settings-head"><p className="eyebrow">Owner only</p><h2>Google Workspace sign-in</h2><p>Create an Internal Web OAuth client in Google Cloud, then enter it here. This is separate from the service account used for calendar synchronization.</p></div>
+      <div className="settings-head"><p className="eyebrow">Administrators</p><h2>Google Workspace sign-in</h2><p>Create an Internal Web OAuth client in Google Cloud, then enter it here. This is separate from the service account used for calendar synchronization.</p></div>
       <div className="access-guide"><ol><li><span>1</span><div><b>Configure the OAuth consent screen</b><p>Use an Internal audience so only accounts in your Workspace can authenticate.</p></div></li><li><span>2</span><div><b>Create a Web application OAuth client</b><p>Add the exact callback URL below as an authorised redirect URI.</p></div></li><li><span>3</span><div><b>Add staff to the allowlist</b><p>Workspace membership alone never grants Relay access.</p></div></li></ol></div>
       <Field label="Authorised redirect URI"><CopyBox value={settings?.callbackUrl ?? "Loading…"} onCopy={() => navigator.clipboard.writeText(settings?.callbackUrl ?? "")} /></Field>
       <form className="oauth-settings-form" onSubmit={saveOAuth}>
@@ -934,15 +1026,15 @@ function AccessPage({ setNotice, onSignedOut }: { setNotice: (notice: Notice) =>
 
     <section className="panel access-panel">
       <div className="settings-head"><h2>IT staff access</h2><p>Pre-approve individual Workspace identities and assign the least privilege they need.</p></div>
-      <div className="role-grid"><div><b>Viewer</b><small>Dashboard, people, and run history</small></div><div><b>Operator</b><small>Viewer access plus diagnostics and manual syncs</small></div><div><b>Administrator</b><small>Operator access plus connections and sync settings</small></div></div>
+      <div className="role-grid"><div><b>Viewer</b><small>Dashboard, people, and run history</small></div><div><b>Operator</b><small>Viewer access plus diagnostics and manual syncs</small></div><div><b>Administrator</b><small>Connections, sync settings, and IT staff access</small></div></div>
       <form className="staff-add-form" onSubmit={addStaff}><Field label="Google Workspace email"><input type="email" value={newStaff.email} onChange={event => setNewStaff(current => ({ ...current, email: event.target.value }))} placeholder="it.staff@school.edu.au" required /></Field><Field label="Display name"><input value={newStaff.displayName} onChange={event => setNewStaff(current => ({ ...current, displayName: event.target.value }))} placeholder="Optional" /></Field><Field label="Role"><select value={newStaff.role} onChange={event => setNewStaff(current => ({ ...current, role: event.target.value as StaffRole }))}><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Administrator</option></select></Field><button className="button primary" type="submit" disabled={busy === "new-staff"}>{busy === "new-staff" ? "Adding…" : "Add staff"}</button></form>
       <div className="staff-list">{staff.map(account => <div className="staff-row" key={account.id}><span className="person-avatar">{(account.displayName || account.email).split(/\s|@/).map(part => part[0]).join("").slice(0, 2).toUpperCase()}</span><div className="staff-identity"><b>{account.displayName || account.email}</b><small>{account.email} · {account.linked ? `Linked · Last login ${account.lastLoginAt ? new Date(account.lastLoginAt).toLocaleString("en-AU") : "not recorded"}` : "Awaiting first Google sign-in"}</small></div><select value={account.role} onChange={event => updateStaff(account.id, { role: event.target.value as StaffRole })} aria-label={`Role for ${account.email}`}><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Administrator</option></select><label className="enable-control"><input type="checkbox" checked={account.enabled} onChange={event => updateStaff(account.id, { enabled: event.target.checked })} />Enabled</label><button className="button secondary" onClick={() => void saveStaff(account)} disabled={busy === account.id}>Save</button><button className="row-delete" onClick={() => void removeStaff(account)} disabled={busy === account.id}>Remove</button></div>)}{staff.length === 0 && <div className="empty-state"><b>No Google Workspace staff added</b><p>Add an email address above. The account remains blocked until explicitly listed here.</p></div>}</div>
     </section>
 
-    <section className="panel access-panel narrow-panel">
+    {canChangeLocalPassword && <section className="panel access-panel narrow-panel">
       <div className="settings-head"><p className="eyebrow">Break-glass account</p><h2>Local administrator password</h2><p>Changing this password signs out the current session. Keep the credential in your IT password vault.</p></div>
       <form className="password-form" onSubmit={changePassword}><Field label="Current password"><input type="password" autoComplete="current-password" value={passwords.currentPassword} onChange={event => setPasswords(current => ({ ...current, currentPassword: event.target.value }))} required /></Field><Field label="New password" hint="At least 14 characters."><input type="password" autoComplete="new-password" minLength={14} value={passwords.nextPassword} onChange={event => setPasswords(current => ({ ...current, nextPassword: event.target.value }))} required /></Field><Field label="Confirm new password"><input type="password" autoComplete="new-password" minLength={14} value={passwords.confirmation} onChange={event => setPasswords(current => ({ ...current, confirmation: event.target.value }))} required /></Field><button className="button secondary" type="submit" disabled={busy === "password"}>{busy === "password" ? "Changing…" : "Change password"}</button></form>
-    </section>
+    </section>}
   </div>;
 }
 

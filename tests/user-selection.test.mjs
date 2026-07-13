@@ -190,6 +190,21 @@ test("a reassigned email activates the new ID and safely retires the stale row",
   assert.equal(snapshot.counts.events, 0, "retained stale mappings must not inflate active coverage metrics");
 });
 
+test("paused unmatched accounts remain informational in aggregate counts", async () => {
+  await storage.discoverUserMappings([
+    discovery("google-only", "google-only@example.edu", {
+      schoolboxUserId: null,
+      schoolboxEmail: null,
+      status: "unmatched",
+      lastError: "No active Schoolbox user has this primary email address.",
+    }),
+  ], false);
+  const snapshot = await storage.statusSnapshot();
+  assert.equal(snapshot.counts.unmatched, 1);
+  assert.equal(snapshot.counts.enabled, 0);
+  assert.equal(snapshot.counts.errors, 0);
+});
+
 after(() => {
   db().close();
   rmSync(temporary, { recursive: true, force: true });

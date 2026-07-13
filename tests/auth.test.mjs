@@ -84,6 +84,42 @@ test("Google staff roles are server enforced and changes revoke sessions", () =>
   assert.equal(relinked.google_sub, null);
 });
 
+test("Google administrators can manage other administrator accounts", () => {
+  const account = auth.saveStaffAccount({ email: "admin@school.edu.au", displayName: "IT Administrator", role: "admin", enabled: true }, "local:administrator");
+  const rawToken = randomBytes(32).toString("base64url");
+  db().prepare("INSERT INTO auth_sessions (token_hash, user_id, created_at, last_seen_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?)")
+    .bind(createHash("sha256").update(rawToken).digest("hex"), account.id, now, now, new Date(Date.now() + 3_600_000).toISOString()).run();
+  const session = auth.requireSession(request("/api/admin/staff", { cookie: `relay_session=${rawToken}` }), "manage_access");
+  assert.equal(session.role, "admin");
+  assert.ok(session.permissions.includes("manage_access"));
+
+  const added = auth.saveStaffAccount({ email: "second-admin@school.edu.au", role: "admin", enabled: true }, session.actor);
+  assert.equal(added.role, "admin");
+});
+
+test("sessions expose their deadlines and can be explicitly extended", () => {
+  const result = auth.localLogin("administrator", password);
+  const cookie = cookieFromHeader(result.cookie);
+  const rawToken = cookie.split("=", 2)[1];
+  const tokenHash = createHash("sha256").update(rawToken).digest("hex");
+  const oldLastSeen = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+  db().prepare("UPDATE auth_sessions SET last_seen_at = ?, absolute_expires_at = ? WHERE token_hash = ?")
+    .bind(oldLastSeen, new Date(Date.now() + 4 * 60 * 1000).toISOString(), tokenHash).run();
+
+  const peeked = auth.currentSession(request("/api/auth/session", { cookie }), { touch: false });
+  assert.ok(peeked?.expiresAt);
+  assert.ok(peeked?.idleExpiresAt);
+  assert.equal(db().prepare("SELECT last_seen_at AS lastSeenAt FROM auth_sessions WHERE token_hash = ?").bind(tokenHash).first()?.lastSeenAt, oldLastSeen);
+
+  const extended = auth.extendSession(request("/api/auth/session", {
+    method: "POST",
+    cookie,
+    csrf: peeked.csrfToken,
+  }));
+  assert.ok(Date.parse(extended.session.expiresAt) > Date.now() + 7 * 60 * 60 * 1000);
+  assert.ok(Date.parse(extended.session.idleExpiresAt) > Date.now() + 29 * 60 * 1000);
+});
+
 test("scheduler credentials are isolated from administrator sessions", () => {
   const valid = new Request("http://127.0.0.1:3000/api/sync/local-tick", {
     method: "POST",

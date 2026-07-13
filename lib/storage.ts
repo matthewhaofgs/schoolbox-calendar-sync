@@ -733,7 +733,7 @@ export async function statusSnapshot(): Promise<{
       SUM(CASE WHEN directory_active = 1 AND sync_enabled = 0 THEN 1 ELSE 0 END) AS disabled,
       SUM(CASE WHEN directory_active = 1 AND sync_enabled = 1 AND status = 'synced' THEN 1 ELSE 0 END) AS healthy,
       SUM(CASE WHEN directory_active = 1 AND sync_enabled = 1 AND status = 'error' THEN 1 ELSE 0 END) AS errors,
-      SUM(CASE WHEN directory_active = 1 AND sync_enabled = 1 AND status = 'unmatched' THEN 1 ELSE 0 END) AS unmatched
+      SUM(CASE WHEN directory_active = 1 AND status = 'unmatched' THEN 1 ELSE 0 END) AS unmatched
       FROM user_mappings`).first<{ users: number; enabled: number; disabled: number; healthy: number; errors: number; unmatched: number }>(),
     db().prepare(`SELECT COUNT(*) AS count FROM event_mappings e
       JOIN user_mappings u ON u.google_user_id = e.google_user_id WHERE u.directory_active = 1`).first<{ count: number }>(),

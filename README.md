@@ -26,16 +26,16 @@ Relay has two authentication paths:
 1. An immutable local break-glass administrator, created interactively on the server. Its password is PBKDF2-HMAC-SHA-256 hashed; plaintext is never stored.
 2. Google Workspace OpenID Connect for explicitly approved IT staff. Relay requests only `openid`, `email`, and `profile`; it does not store Google access or refresh tokens.
 
-Workspace membership alone does not grant access. The local administrator adds each staff email and selects a role:
+Workspace membership alone does not grant access. The local administrator or an existing Administrator adds each staff email and selects a role:
 
 | Role | Access |
 | --- | --- |
 | Viewer | Dashboard, people/mappings, and run history |
 | Operator | Viewer access plus diagnostics and manual syncs |
-| Administrator | Operator access plus Schoolbox/Google connections, schedule, and sync settings |
-| Local administrator | All administrator rights plus Google sign-in configuration and staff/role management |
+| Administrator | Operator access plus Schoolbox/Google connections, schedule, Google sign-in configuration, and staff/role management |
+| Local administrator | All administrator rights plus ownership of the local break-glass password |
 
-All permissions are checked by the server. Sessions use opaque random tokens stored as hashes in SQLite, HTTP-only cookies, an eight-hour maximum life, a 30-minute idle timeout, exact-origin checks, and CSRF tokens. Five failed local password attempts temporarily lock the account for 15 minutes.
+All permissions are checked by the server. Sessions use opaque random tokens stored as hashes in SQLite, HTTP-only cookies, an eight-hour maximum life, a 30-minute idle timeout, exact-origin checks, and CSRF tokens. The UI warns five minutes before the earliest session deadline and lets the administrator explicitly extend it; an expired session returns directly to sign-in. Five failed local password attempts temporarily lock the account for 15 minutes.
 
 ## Requirements
 
@@ -128,6 +128,8 @@ The development origin is `http://127.0.0.1:3000`; production requires HTTPS.
 7. Add each IT staff member's primary Google Workspace email and select Viewer, Operator, or Administrator.
 8. Staff can now choose **Continue with Google Workspace** on the Relay login screen.
 
+After this bootstrap, any enabled Administrator can add, change, disable, or remove other Google Workspace staff entries. Only the immutable local administrator can change the break-glass password.
+
 The `hd` login hint is not trusted by itself. Relay verifies the signed Google ID token, issuer, audience, expiry, nonce, verified email, Workspace domain, and stable Google subject before creating a session.
 
 ## Schoolbox and calendar setup
@@ -150,6 +152,8 @@ https://www.googleapis.com/auth/admin.directory.user.readonly,https://www.google
 
 The Web OAuth client used for IT login and the service account used for calendar synchronization are separate credentials with separate purposes.
 
+After both connections and credentials are saved, **Setup** changes to a completed connection summary. Reopen the wizard only when replacing credentials or delegation; routine sync changes remain under **Settings**.
+
 ## Pilot and user coverage
 
 Relay discovers every active Google Workspace identity on each run, records its Schoolbox email match, and syncs only users whose **Calendar sync** control is enabled.
@@ -157,6 +161,7 @@ Relay discovers every active Google Workspace identity on each run, records its 
 - Open **People** to search and filter all discovered users, toggle one user, or select visible rows for a bulk enable/pause action.
 - **Remove Relay events** pauses that user and deletes only events recorded in Relay's managed-event mapping table. Other Google Calendar entries are never selected for deletion.
 - Open **Settings > People** to choose whether users discovered in future start enabled or paused. Changing this default never changes existing selections.
+- Google Workspace accounts without an active Schoolbox email match are labelled **Unmatched** as an informational state. This is expected for former staff, service accounts, and other Google-only identities.
 - Pausing a user stops future updates; it does not remove Relay-created events already present in Google Calendar.
 - Viewer and Operator accounts can see coverage. Administrator and local-administrator accounts can change it.
 - Existing installations migrate existing users and the new-user default to enabled, preserving the previous sync-all behaviour.
