@@ -1,0 +1,30 @@
+services:
+  relay:
+    build:
+      context: .
+    image: relay-schoolbox-calendar:local
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    ports:
+      - "0.0.0.0:3000:3000"
+    volumes:
+      - relay-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+      - /app/.next/cache:size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  relay-data:
+    name: relay-calendar-data
