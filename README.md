@@ -155,6 +155,7 @@ The Web OAuth client used for IT login and the service account used for calendar
 Relay discovers every active Google Workspace identity on each run, records its Schoolbox email match, and syncs only users whose **Calendar sync** control is enabled.
 
 - Open **People** to search and filter all discovered users, toggle one user, or select visible rows for a bulk enable/pause action.
+- **Remove Relay events** pauses that user and deletes only events recorded in Relay's managed-event mapping table. Other Google Calendar entries are never selected for deletion.
 - Open **Settings > People** to choose whether users discovered in future start enabled or paused. Changing this default never changes existing selections.
 - Pausing a user stops future updates; it does not remove Relay-created events already present in Google Calendar.
 - Viewer and Operator accounts can see coverage. Administrator and local-administrator accounts can change it.

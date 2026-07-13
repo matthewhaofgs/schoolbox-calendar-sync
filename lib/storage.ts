@@ -605,12 +605,13 @@ export async function setUsersSyncEnabled(ids: string[], enabled: boolean, actor
 export async function listUserMappings(limit?: number, includeInactive = false): Promise<UserMapping[]> {
   await ensureSchema();
   const statement = db()
-    .prepare(`SELECT google_user_id AS googleUserId, google_email AS googleEmail, schoolbox_user_id AS schoolboxUserId,
-      schoolbox_email AS schoolboxEmail, display_name AS displayName, role, status, last_sync_at AS lastSyncAt,
-      last_error AS lastError, event_count AS eventCount, sync_enabled AS syncEnabled,
-      directory_active AS directoryActive, updated_at AS updatedAt
-      FROM user_mappings${includeInactive ? "" : " WHERE directory_active = 1"}
-      ORDER BY google_email${limit === undefined ? "" : " LIMIT ?"}`);
+    .prepare(`SELECT u.google_user_id AS googleUserId, u.google_email AS googleEmail, u.schoolbox_user_id AS schoolboxUserId,
+      u.schoolbox_email AS schoolboxEmail, u.display_name AS displayName, u.role, u.status, u.last_sync_at AS lastSyncAt,
+      u.last_error AS lastError,
+      (SELECT COUNT(*) FROM event_mappings e WHERE e.google_user_id = u.google_user_id) AS eventCount,
+      u.sync_enabled AS syncEnabled, u.directory_active AS directoryActive, u.updated_at AS updatedAt
+      FROM user_mappings u${includeInactive ? "" : " WHERE u.directory_active = 1"}
+      ORDER BY u.google_email${limit === undefined ? "" : " LIMIT ?"}`);
   const result = limit === undefined
     ? statement.all<UserMapping>()
     : statement.bind(Math.max(1, Math.min(limit, 5000))).all<UserMapping>();
@@ -619,6 +620,24 @@ export async function listUserMappings(limit?: number, includeInactive = false):
     mapping.directoryActive = Boolean(mapping.directoryActive);
   }
   return result.results;
+}
+
+export async function getUserMapping(googleUserId: string): Promise<UserMapping | null> {
+  await ensureSchema();
+  const mapping = db()
+    .prepare(`SELECT u.google_user_id AS googleUserId, u.google_email AS googleEmail, u.schoolbox_user_id AS schoolboxUserId,
+      u.schoolbox_email AS schoolboxEmail, u.display_name AS displayName, u.role, u.status, u.last_sync_at AS lastSyncAt,
+      u.last_error AS lastError,
+      (SELECT COUNT(*) FROM event_mappings e WHERE e.google_user_id = u.google_user_id) AS eventCount,
+      u.sync_enabled AS syncEnabled, u.directory_active AS directoryActive, u.updated_at AS updatedAt
+      FROM user_mappings u WHERE u.google_user_id = ? AND u.directory_active = 1`)
+    .bind(googleUserId)
+    .first<UserMapping>();
+  if (mapping) {
+    mapping.syncEnabled = Boolean(mapping.syncEnabled);
+    mapping.directoryActive = Boolean(mapping.directoryActive);
+  }
+  return mapping;
 }
 
 export async function getEventMappings(googleUserId: string): Promise<EventMapping[]> {
@@ -666,6 +685,38 @@ export async function touchEventMapping(googleUserId: string, sourceKey: string,
 export async function deleteEventMapping(googleUserId: string, sourceKey: string): Promise<void> {
   await ensureSchema();
   await db().prepare("DELETE FROM event_mappings WHERE google_user_id = ? AND source_key = ?").bind(googleUserId, sourceKey).run();
+}
+
+export async function recordManagedEventCleanup(options: {
+  googleUserId: string;
+  remaining: number;
+  deleted: number;
+  alreadyMissing: number;
+  error: string | null;
+  actor: string;
+}): Promise<void> {
+  await ensureSchema();
+  if (!Number.isInteger(options.remaining) || options.remaining < 0) {
+    throw new HttpError(400, "The remaining event count is invalid");
+  }
+  const now = new Date().toISOString();
+  const error = options.error?.slice(0, 2_000) ?? null;
+  const binding = db();
+  binding.transaction(() => {
+    const result = binding.prepare(`UPDATE user_mappings SET sync_enabled = 0, event_count = ?,
+      status = CASE WHEN ? IS NOT NULL THEN 'error' WHEN schoolbox_user_id IS NULL THEN 'unmatched' ELSE 'pending' END,
+      last_error = ?, updated_at = ? WHERE google_user_id = ? AND directory_active = 1`)
+      .bind(options.remaining, error, error, now, options.googleUserId)
+      .run();
+    if (Number(result.changes) !== 1) throw new HttpError(404, "This user is no longer available");
+    binding.prepare("INSERT INTO audit_log (occurred_at, actor, action, detail) VALUES (?, ?, 'users.managed_events_cleanup', ?)")
+      .bind(
+        now,
+        options.actor,
+        `${options.deleted} managed event(s) deleted, ${options.alreadyMissing} already absent, ${options.remaining} remaining`,
+      )
+      .run();
+  });
 }
 
 export async function statusSnapshot(): Promise<{

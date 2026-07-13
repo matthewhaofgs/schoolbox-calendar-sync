@@ -11,7 +11,7 @@ process.env.CONFIG_ENCRYPTION_KEY = randomBytes(32).toString("base64");
 process.env.NODE_ENV = "test";
 
 const storage = await import("../lib/storage.ts");
-const { runFullSync } = await import("../lib/sync.ts");
+const { cleanupUserManagedEvents, runFullSync } = await import("../lib/sync.ts");
 const { db } = await import("../lib/db.ts");
 
 await storage.saveConfig({
@@ -101,6 +101,40 @@ test("runFullSync never processes paused matches and does process enabled matche
   assert.equal(mappings.get("google-enabled")?.status, "synced");
   assert.equal(mappings.get("google-paused")?.syncEnabled, false);
   assert.equal(mappings.get("google-paused")?.lastSyncAt, null);
+
+  const cleanup = await cleanupUserManagedEvents(
+    "google-enabled",
+    "local:administrator",
+    clients.google,
+  );
+  assert.deepEqual(cleanup, {
+    paused: true,
+    deleted: 1,
+    alreadyMissing: 0,
+    remaining: 0,
+    error: null,
+  });
+  assert.deepEqual(calls.deletedFor, ["enabled@example.edu"]);
+  assert.equal((await storage.getEventMappings("google-enabled")).length, 0);
+  const cleanedUser = await storage.getUserMapping("google-enabled");
+  assert.equal(cleanedUser?.syncEnabled, false, "cleanup must pause the user before removing events");
+  assert.equal(cleanedUser?.eventCount, 0);
+  assert.equal(cleanedUser?.status, "pending");
+
+  await storage.setUsersSyncEnabled(["google-enabled"], true, "local:administrator");
+  await runFullSync("test", "test:runner", clients);
+  const failedCleanup = await cleanupUserManagedEvents(
+    "google-enabled",
+    "local:administrator",
+    { async deleteEvent() { throw new Error("simulated Google delete failure"); } },
+  );
+  assert.equal(failedCleanup.deleted, 0);
+  assert.equal(failedCleanup.remaining, 1, "a failed Google deletion must keep Relay's mapping for retry");
+  assert.match(failedCleanup.error ?? "", /simulated Google delete failure/);
+  assert.equal((await storage.getEventMappings("google-enabled")).length, 1);
+  const cleanupFailureUser = await storage.getUserMapping("google-enabled");
+  assert.equal(cleanupFailureUser?.syncEnabled, false);
+  assert.equal(cleanupFailureUser?.status, "error");
 });
 
 after(() => {

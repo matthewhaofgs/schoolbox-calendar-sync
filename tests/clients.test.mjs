@@ -68,6 +68,33 @@ test("Schoolbox user pagination follows cursor metadata", async () => {
   assert.equal(requests[0].authorization, "Bearer test-jwt");
 });
 
+test("Schoolbox user pagination follows legacy scalar cursors", async () => {
+  const requestedCursors = [];
+  const client = new SchoolboxClient({
+    baseUrl: "https://school.example.edu/",
+    jwt: "test-jwt",
+    fetchImpl: async (input) => {
+      const cursor = new URL(String(input)).searchParams.get("cursor");
+      requestedCursors.push(cursor);
+      if (cursor === null) {
+        return Response.json({
+          data: [{ id: 1, email: "one@example.edu" }],
+          metadata: { count: 2, cursor: 1012 },
+        });
+      }
+      assert.equal(cursor, "1012");
+      return Response.json({
+        data: [{ id: 2, email: "two@example.edu" }],
+        metadata: { count: 2, cursor: null },
+      });
+    },
+  });
+
+  const users = await client.getAllUsers();
+  assert.deepEqual(users.map((user) => user.id), [1, 2]);
+  assert.deepEqual(requestedCursors, [null, "1012"]);
+});
+
 test("Google IDs and hashes are deterministic and Calendar-safe", async () => {
   const firstId = await createDeterministicEventId("tenant:user:schoolbox:event:42");
   const secondId = await createDeterministicEventId("tenant:user:schoolbox:event:42");

@@ -50,6 +50,7 @@ type Person = {
   role: string;
   status: "Synced" | "Syncing" | "Pending" | "Unmatched" | "Error";
   syncEnabled: boolean;
+  eventCount: number;
   lastSync: string;
 };
 
@@ -89,6 +90,7 @@ function normalisePeople(value: unknown): Person[] | null {
       role: String(row.role ?? "User"),
       status,
       syncEnabled: row.syncEnabled === undefined ? true : Boolean(row.syncEnabled),
+      eventCount: Math.max(0, Number(row.eventCount ?? 0)),
       lastSync: String(row.lastSync ?? row.lastSyncAt ?? row.last_synced_at ?? "Not yet"),
     };
   });
@@ -728,9 +730,43 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
       setBusy(false);
     }
   };
+  const cleanupManagedEvents = async (person: Person) => {
+    if (busy || person.eventCount === 0) return;
+    const confirmed = window.confirm(
+      `Pause calendar sync for ${person.name} and remove ${person.eventCount} Relay-managed ${person.eventCount === 1 ? "event" : "events"} from their Google Calendar? Other calendar entries will not be touched.`,
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      const payload = await fetchJson("/api/users", {
+        method: "DELETE",
+        body: JSON.stringify({ userId: person.id }),
+      });
+      const deleted = Number(payload.deleted ?? 0);
+      const alreadyMissing = Number(payload.alreadyMissing ?? 0);
+      const remaining = Number(payload.remaining ?? 0);
+      const cleanupError = typeof payload.error === "string" ? payload.error : null;
+      setPeople(current => current.map(row => row.id === person.id ? {
+        ...row,
+        syncEnabled: false,
+        eventCount: remaining,
+        status: remaining > 0 ? "Error" : row.status === "Unmatched" ? "Unmatched" : "Pending",
+      } : row));
+      if (remaining > 0 || cleanupError) {
+        setNotice({ kind: "error", message: `Cleanup paused this user and removed ${deleted} event(s), but ${remaining} Relay-managed event(s) remain. Retry after checking Google access.` });
+      } else {
+        const missingNote = alreadyMissing > 0 ? ` ${alreadyMissing} tracked event(s) were already absent.` : "";
+        setNotice({ kind: "success", message: `Calendar sync paused and ${deleted} Relay-managed event(s) removed.${missingNote}` });
+      }
+    } catch (error) {
+      setNotice({ kind: "error", message: error instanceof Error ? error.message : "Relay-managed events could not be removed." });
+    } finally {
+      setBusy(false);
+    }
+  };
   const exportCsv = () => {
     const escape = (value: string) => `"${value.replaceAll('"', '""')}"`;
-    const rows = [["Name", "Schoolbox email", "Google email", "Role", "Calendar sync", "Status", "Last sync"], ...filtered.map(person => [person.name, person.schoolboxEmail, person.googleEmail, person.role, person.syncEnabled ? "Enabled" : "Paused", person.status, person.lastSync])];
+    const rows = [["Name", "Schoolbox email", "Google email", "Role", "Calendar sync", "Relay-managed events", "Status", "Last sync"], ...filtered.map(person => [person.name, person.schoolboxEmail, person.googleEmail, person.role, person.syncEnabled ? "Enabled" : "Paused", String(person.eventCount), person.status, person.lastSync])];
     const url = URL.createObjectURL(new Blob([rows.map(row => row.map(escape).join(",")).join("\n")], { type: "text/csv;charset=utf-8" }));
     const link = document.createElement("a");
     link.href = url;
@@ -742,8 +778,8 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
     <section className="people-summary"><div><span className="summary-icon green">#</span><p><b>{people.length || counts?.users || 0}</b><small>Discovered</small></p></div><div><span className="summary-icon green">✓</span><p><b>{enabledCount}</b><small>Enabled</small></p></div><div><span className="summary-icon amber">Ⅱ</span><p><b>{pausedCount}</b><small>Paused</small></p></div><div><span className="summary-icon red">!</span><p><b>{people.length ? people.filter(p => p.status === "Unmatched" || p.status === "Error").length : (counts?.unmatched ?? 0) + (counts?.errors ?? 0)}</b><small>Needs attention</small></p></div></section>
     <section className="panel people-panel" aria-busy={busy}><div className="people-tools"><div className="search-box"><span aria-hidden="true">⌕</span><input value={query} onChange={e => { setQuery(e.target.value); setPage(0); setSelected(new Set()); }} placeholder="Search people or email…" aria-label="Search people" /></div><select value={coverageFilter} onChange={e => { setCoverageFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter calendar sync coverage"><option>All coverage</option><option>Enabled</option><option>Paused</option></select><select value={statusFilter} onChange={e => { setStatusFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter sync status"><option>All statuses</option><option>Synced</option><option>Syncing</option><option>Pending</option><option>Unmatched</option><option>Error</option></select><button className="button ghost" onClick={exportCsv}>Export CSV</button></div>
       {canConfigure && selectedVisible > 0 && <div className="people-bulk" role="status"><b>{selectedVisible} selected</b><span>Bulk changes apply only to the selected visible users.</span><button className="button secondary" onClick={() => void updateCoverage(selectedIds, true)} disabled={busy}>Enable selected</button><button className="button ghost" onClick={() => void updateCoverage(selectedIds, false)} disabled={busy}>Pause selected</button></div>}
-      <div className="coverage-note"><span>i</span><p><b>Pausing stops future updates.</b> Existing Relay-created Google events are left in place. Change the default for newly discovered users under <strong>Settings → People</strong>.</p></div>
-      <div className="table-wrap"><table className="people-table"><caption className="sr-only">Discovered Google Workspace users and their Schoolbox calendar sync coverage</caption><thead><tr>{canConfigure && <th scope="col" className="selection-column"><input ref={selectAllRef} type="checkbox" checked={visible.length > 0 && selectedVisible === visible.length} onChange={event => selectVisible(event.target.checked)} aria-label="Select visible users" disabled={busy || visible.length === 0} /></th>}<th scope="col">Person</th><th scope="col">Schoolbox identity</th><th scope="col">Google Workspace</th><th scope="col">Role</th><th scope="col">Calendar sync</th><th scope="col">Status</th><th scope="col">Last sync</th></tr></thead><tbody>{visible.map(person => <tr key={person.id}>{canConfigure && <td className="selection-column"><input type="checkbox" checked={selected.has(person.id)} onChange={event => selectOne(person.id, event.target.checked)} aria-label={`Select ${person.name}`} disabled={busy} /></td>}<th scope="row" className="person-row-header"><div className="person-cell"><span className="person-avatar">{person.name.split(" ").map(part => part[0]).join("").slice(0, 2)}</span><div><b>{person.name}</b><small>{person.id}</small></div></div></th><td>{person.schoolboxEmail}</td><td className={person.googleEmail === "—" ? "muted" : ""}>{person.googleEmail}</td><td>{person.role}</td><td>{canConfigure ? <label className="sync-switch"><input type="checkbox" checked={person.syncEnabled} onChange={event => void updateCoverage([person.id], event.target.checked)} disabled={busy} aria-label={`Sync calendar for ${person.name}`} /><span aria-hidden="true" /><b>{person.syncEnabled ? "Enabled" : "Paused"}</b></label> : <span className={`coverage-state ${person.syncEnabled ? "enabled" : "paused"}`}>{person.syncEnabled ? "Enabled" : "Paused"}</span>}</td><td><StatusPill status={person.status} /></td><td>{person.lastSync}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state"><b>{loadError ? "People could not be loaded" : people.length === 0 ? "No people discovered yet" : "No people found"}</b><p>{loadError ? "Refresh after checking the server connection and logs." : people.length === 0 ? "Complete setup and run a sync to discover Workspace users. If the new-user default is paused, discovery will not write calendar events." : "Try different search or filter options."}</p></div>}</div>
+      <div className="coverage-note"><span>i</span><p><b>Pausing stops future updates.</b> Existing Relay-created Google events stay in place until you use <strong>Remove Relay events</strong>. That cleanup uses Relay&apos;s event records and leaves every other calendar entry alone.</p></div>
+      <div className="table-wrap"><table className="people-table"><caption className="sr-only">Discovered Google Workspace users and their Schoolbox calendar sync coverage</caption><thead><tr>{canConfigure && <th scope="col" className="selection-column"><input ref={selectAllRef} type="checkbox" checked={visible.length > 0 && selectedVisible === visible.length} onChange={event => selectVisible(event.target.checked)} aria-label="Select visible users" disabled={busy || visible.length === 0} /></th>}<th scope="col">Person</th><th scope="col">Schoolbox identity</th><th scope="col">Google Workspace</th><th scope="col">Role</th><th scope="col">Calendar sync</th><th scope="col">Managed events</th><th scope="col">Status</th><th scope="col">Last sync</th></tr></thead><tbody>{visible.map(person => <tr key={person.id}>{canConfigure && <td className="selection-column"><input type="checkbox" checked={selected.has(person.id)} onChange={event => selectOne(person.id, event.target.checked)} aria-label={`Select ${person.name}`} disabled={busy} /></td>}<th scope="row" className="person-row-header"><div className="person-cell"><span className="person-avatar">{person.name.split(" ").map(part => part[0]).join("").slice(0, 2)}</span><div><b>{person.name}</b><small>{person.id}</small></div></div></th><td>{person.schoolboxEmail}</td><td className={person.googleEmail === "—" ? "muted" : ""}>{person.googleEmail}</td><td>{person.role}</td><td>{canConfigure ? <label className="sync-switch"><input type="checkbox" checked={person.syncEnabled} onChange={event => void updateCoverage([person.id], event.target.checked)} disabled={busy} aria-label={`Sync calendar for ${person.name}`} /><span aria-hidden="true" /><b>{person.syncEnabled ? "Enabled" : "Paused"}</b></label> : <span className={`coverage-state ${person.syncEnabled ? "enabled" : "paused"}`}>{person.syncEnabled ? "Enabled" : "Paused"}</span>}</td><td><div className="managed-events-cell"><b>{person.eventCount}</b>{canConfigure && <button type="button" onClick={() => void cleanupManagedEvents(person)} disabled={busy || person.eventCount === 0} title={person.eventCount === 0 ? "No Relay-managed events to remove" : "Pause this user and remove only Relay-managed events"}>Remove Relay events</button>}</div></td><td><StatusPill status={person.status} /></td><td>{person.lastSync}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state"><b>{loadError ? "People could not be loaded" : people.length === 0 ? "No people discovered yet" : "No people found"}</b><p>{loadError ? "Refresh after checking the server connection and logs." : people.length === 0 ? "Complete setup and run a sync to discover Workspace users. If the new-user default is paused, discovery will not write calendar events." : "Try different search or filter options."}</p></div>}</div>
       <div className="table-footer"><span>{filtered.length ? `Showing ${pageIndex * pageSize + 1}–${Math.min((pageIndex + 1) * pageSize, filtered.length)} of ${filtered.length} matching people` : `0 of ${people.length} people`}</span><div><button onClick={() => { setPage(Math.max(0, pageIndex - 1)); setSelected(new Set()); }} disabled={pageIndex === 0}>Previous</button><span>Page {pageIndex + 1} of {pageCount}</span><button onClick={() => { setPage(Math.min(pageCount - 1, pageIndex + 1)); setSelected(new Set()); }} disabled={pageIndex >= pageCount - 1}>Next</button></div></div>
     </section>
   </>;

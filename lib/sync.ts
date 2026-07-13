@@ -16,8 +16,11 @@ import {
   finishRun,
   getConfig,
   getEventMappings,
+  getUserMapping,
   listRuns,
+  recordManagedEventCleanup,
   recoverStaleRuns,
+  setUsersSyncEnabled,
   touchRunHeartbeat,
   touchEventMapping,
   upsertEventMapping,
@@ -29,11 +32,20 @@ import { HttpError } from "./security";
 type MatchedUser = { google: GoogleDirectoryUser; schoolbox: SchoolboxUser };
 type SchoolboxSyncClient = Pick<SchoolboxClient, "getAllUsers" | "getCalendarEvents">;
 type GoogleSyncClient = Pick<GoogleWorkspaceClient, "listAllUsers" | "insertEvent" | "updateEvent" | "deleteEvent">;
+type GoogleCleanupClient = Pick<GoogleWorkspaceClient, "deleteEvent">;
 
 /** Optional client overrides used by deterministic integration tests. */
 export type SyncClientOverrides = {
   schoolbox?: SchoolboxSyncClient;
   google?: GoogleSyncClient;
+};
+
+export type ManagedEventCleanupResult = {
+  paused: true;
+  deleted: number;
+  alreadyMissing: number;
+  remaining: number;
+  error: string | null;
 };
 
 function normalizedEmail(value: string | null | undefined): string {
@@ -238,6 +250,102 @@ async function syncUser(
     });
     run.errors += 1;
   }
+}
+
+/**
+ * Pauses one user and removes only Google events tracked in Relay's own
+ * event_mappings table. Unrelated calendar entries are never listed or
+ * deleted by this operation.
+ */
+export async function cleanupUserManagedEvents(
+  googleUserId: string,
+  actor: string,
+  clientOverride?: GoogleCleanupClient,
+): Promise<ManagedEventCleanupResult> {
+  const userId = googleUserId.trim();
+  if (!userId) throw new HttpError(400, "Choose a user to clean up");
+
+  const mapping = await getUserMapping(userId);
+  if (!mapping) throw new HttpError(404, "This user is no longer available");
+
+  const storedMappings = await getEventMappings(userId);
+  if (storedMappings.length > 0) await recoverStaleRuns();
+  if (storedMappings.length > 0 && (await listRuns(1))[0]?.status === "running") {
+    throw new HttpError(
+      409,
+      "Wait for the current calendar sync run to finish, then retry cleanup.",
+    );
+  }
+
+  // Pausing before the first delete prevents future scheduled runs from
+  // recreating the events immediately after a successful cleanup.
+  await setUsersSyncEnabled([userId], false, actor);
+  if (storedMappings.length === 0) {
+    await recordManagedEventCleanup({
+      googleUserId: userId,
+      remaining: 0,
+      deleted: 0,
+      alreadyMissing: 0,
+      error: null,
+      actor,
+    });
+    return { paused: true, deleted: 0, alreadyMissing: 0, remaining: 0, error: null };
+  }
+
+  let google: GoogleCleanupClient;
+  try {
+    if (clientOverride) {
+      google = clientOverride;
+    } else {
+      const config = await getConfig(true);
+      if (!config.googleServiceAccountJson) throw new HttpError(409, "Google Workspace is not configured");
+      google = new GoogleWorkspaceClient(parseServiceAccountJson(config.googleServiceAccountJson));
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Google Workspace cleanup could not start";
+    await recordManagedEventCleanup({
+      googleUserId: userId,
+      remaining: storedMappings.length,
+      deleted: 0,
+      alreadyMissing: 0,
+      error: message,
+      actor,
+    });
+    throw error;
+  }
+
+  let deleted = 0;
+  let alreadyMissing = 0;
+  let cleanupError: string | null = null;
+  for (const eventMapping of storedMappings) {
+    try {
+      await google.deleteEvent(mapping.googleEmail, eventMapping.googleEventId, {
+        calendarId: "primary",
+        quotaUser: userId,
+        sendUpdates: "none",
+      });
+      deleted += 1;
+    } catch (error) {
+      if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) {
+        alreadyMissing += 1;
+      } else {
+        cleanupError = error instanceof Error ? error.message : "Google Calendar cleanup failed";
+        break;
+      }
+    }
+    await deleteEventMapping(userId, eventMapping.sourceKey);
+  }
+
+  const remaining = (await getEventMappings(userId)).length;
+  await recordManagedEventCleanup({
+    googleUserId: userId,
+    remaining,
+    deleted,
+    alreadyMissing,
+    error: cleanupError,
+    actor,
+  });
+  return { paused: true, deleted, alreadyMissing, remaining, error: cleanupError };
 }
 
 export async function runFullSync(

@@ -743,12 +743,22 @@ export class SchoolboxClient {
     }
 
     const metadataValue = isRecord(value.metadata) ? value.metadata : {};
-    const cursorValue = isRecord(metadataValue.cursor) ? metadataValue.cursor : undefined;
-    const current = cursorValue?.current;
-    // `metadata.cursor.next` is the documented shape. The fallbacks make the
-    // client tolerant of older Schoolbox builds which flattened list metadata.
-    const next = cursorValue?.next ?? metadataValue.next ?? value.next;
-    const hasCursorMetadata = cursorValue !== undefined || typeof next === "string";
+    const rawCursor = metadataValue.cursor;
+    const cursorValue = isRecord(rawCursor) ? rawCursor : undefined;
+    const scalarCursor =
+      typeof rawCursor === "string" || typeof rawCursor === "number"
+        ? String(rawCursor)
+        : undefined;
+    const current = cursorValue?.current ?? (scalarCursor !== undefined ? options.cursor : undefined);
+    // Newer Schoolbox releases document `metadata.cursor.next`. Some older
+    // installations instead return the next cursor directly as a string or
+    // number in `metadata.cursor`. Support both forms so a full directory is
+    // not silently reduced to the first page.
+    const next = cursorValue?.next ?? scalarCursor ?? metadataValue.next ?? value.next;
+    const hasCursorMetadata =
+      Object.prototype.hasOwnProperty.call(metadataValue, "cursor") ||
+      typeof next === "string" ||
+      typeof next === "number";
     const metadata: SchoolboxListMetadata = {
       ...(asFiniteNumber(metadataValue.count) !== undefined
         ? { count: asFiniteNumber(metadataValue.count) }
@@ -756,8 +766,14 @@ export class SchoolboxClient {
       ...(hasCursorMetadata
         ? {
             cursor: {
-              current: typeof current === "string" ? current : null,
-              next: typeof next === "string" && next.length > 0 ? next : null,
+              current:
+                typeof current === "string" || typeof current === "number"
+                  ? String(current)
+                  : null,
+              next:
+                (typeof next === "string" || typeof next === "number") && String(next).length > 0
+                  ? String(next)
+                  : null,
             },
           }
         : {}),
@@ -782,6 +798,13 @@ export class SchoolboxClient {
         signal: options.signal,
       });
       users.push(...page.data);
+
+      // Older Schoolbox installations may always emit a scalar cursor, even
+      // on their final non-empty page. The total lets us finish without an
+      // unnecessary empty request or a false repeated-cursor error.
+      if (page.metadata.count !== undefined && users.length >= page.metadata.count) {
+        return users;
+      }
 
       const nextCursor = page.metadata.cursor?.next ?? undefined;
       if (!nextCursor) {
