@@ -37,7 +37,7 @@ import {
 } from "./storage";
 import { HttpError } from "./security";
 
-type MatchedUser = { google: GoogleDirectoryUser; schoolbox: SchoolboxUser };
+type MatchedUser = { google: GoogleDirectoryUser; schoolbox: SchoolboxUser; schoolboxEmail: string };
 type SchoolboxSyncClient = Pick<SchoolboxClient, "getAllUsers" | "getCalendarEvents">;
 type GoogleSyncClient = Pick<GoogleWorkspaceClient, "listAllUsers" | "createCalendar" | "updateCalendar" | "insertEvent" | "updateEvent" | "deleteEvent">;
 type GoogleCleanupClient = Pick<GoogleWorkspaceClient, "deleteEvent">;
@@ -58,6 +58,30 @@ export type ManagedEventCleanupResult = {
 
 function normalizedEmail(value: string | null | undefined): string {
   return (value ?? "").trim().toLowerCase();
+}
+
+/**
+ * Index active Schoolbox users by either primary or alternate email.
+ * Ambiguous addresses are deliberately omitted so Relay cannot associate a
+ * Google account with the wrong Schoolbox identity.
+ */
+export function indexActiveSchoolboxUsersByEmail(users: SchoolboxUser[]): Map<string, SchoolboxUser> {
+  const candidates = new Map<string, Map<number, SchoolboxUser>>();
+  for (const user of users.filter(isSchoolboxActive)) {
+    for (const value of [user.email, user.altEmail]) {
+      const email = normalizedEmail(value);
+      if (!email) continue;
+      const usersForEmail = candidates.get(email) ?? new Map<number, SchoolboxUser>();
+      usersForEmail.set(user.id, user);
+      candidates.set(email, usersForEmail);
+    }
+  }
+
+  const unique = new Map<string, SchoolboxUser>();
+  for (const [email, usersForEmail] of candidates) {
+    if (usersForEmail.size === 1) unique.set(email, usersForEmail.values().next().value!);
+  }
+  return unique;
 }
 
 function schoolboxDisplayName(user: SchoolboxUser): string {
@@ -217,7 +241,7 @@ async function syncUser(
     googleUserId,
     googleEmail,
     schoolboxUserId: match.schoolbox.id,
-    schoolboxEmail: match.schoolbox.email ?? null,
+    schoolboxEmail: match.schoolboxEmail,
     displayName: googleDisplayName(match.google) || schoolboxDisplayName(match.schoolbox),
     role: schoolboxRole(match.schoolbox),
     updatedAt: new Date().toISOString(),
@@ -513,26 +537,24 @@ export async function runFullSync(
       google.listAllUsers(config.googleAdminEmail, { customer: config.googleCustomer || "my_customer" }),
     ]);
 
-    const activeSchoolbox = schoolboxUsers.filter(isSchoolboxActive);
-    const schoolboxByEmail = new Map(
-      activeSchoolbox.filter((user) => normalizedEmail(user.email)).map((user) => [normalizedEmail(user.email), user]),
-    );
+    const schoolboxByEmail = indexActiveSchoolboxUsersByEmail(schoolboxUsers);
     const activeGoogle = googleUsers.filter(isGoogleActive);
     const matched: MatchedUser[] = [];
     const discoveredAt = new Date().toISOString();
     const discoveries = activeGoogle.map((googleUser) => {
-      const schoolboxUser = schoolboxByEmail.get(normalizedEmail(googleUser.primaryEmail));
-      if (schoolboxUser) matched.push({ google: googleUser, schoolbox: schoolboxUser });
+      const googleEmail = normalizedEmail(googleUser.primaryEmail);
+      const schoolboxUser = schoolboxByEmail.get(googleEmail);
+      if (schoolboxUser) matched.push({ google: googleUser, schoolbox: schoolboxUser, schoolboxEmail: googleEmail });
       return {
         googleUserId: googleUser.id,
         googleEmail: googleUser.primaryEmail,
         schoolboxUserId: schoolboxUser?.id ?? null,
-        schoolboxEmail: schoolboxUser?.email ?? null,
+        schoolboxEmail: schoolboxUser ? googleEmail : null,
         displayName: googleDisplayName(googleUser) || (schoolboxUser ? schoolboxDisplayName(schoolboxUser) : null),
         role: schoolboxUser ? schoolboxRole(schoolboxUser) : null,
         status: schoolboxUser ? "pending" : "unmatched",
         lastSyncAt: null,
-        lastError: schoolboxUser ? null : "No active Schoolbox user has this primary email address.",
+        lastError: schoolboxUser ? null : "No active Schoolbox user has this primary or alternate email address.",
         eventCount: 0,
         updatedAt: discoveredAt,
       };
