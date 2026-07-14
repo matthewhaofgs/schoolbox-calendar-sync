@@ -148,7 +148,10 @@ function classifyEventCategory(raw: RawSchoolboxCalendarEvent): EventCategory {
   if (/\b(resource|booking)\b/.test(classification)) {
     return "resource_booking";
   }
-  if (raw.data?.classAttendance?.url || /\b(timetable|lesson|class)\b/.test(classification)) return "timetable";
+  // Schoolbox documents classAttendance as being present for class events.
+  // Its URL may legitimately be null or empty for delegated calendar reads,
+  // so object presence is the stable timetable marker.
+  if (raw.data?.classAttendance !== undefined || /\b(timetable|lesson|class)\b/.test(classification)) return "timetable";
   if (/\b(individual|personal)\b/.test(classification)) return "individual_event";
   if (/\bschool[ _-]?event\b/.test(classification)) return "school_event";
   return "other";

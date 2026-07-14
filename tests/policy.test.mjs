@@ -39,6 +39,7 @@ test("Schoolbox normalization classifies documented calendar sources", () => {
     allDay: false,
   };
   assert.equal(normalizeSchoolboxCalendarEvent({ ...common, className: "timetable source1", data: { meta: { type: "Timetable" } } }, 1).category, "timetable");
+  assert.equal(normalizeSchoolboxCalendarEvent({ ...common, className: "source4 type1", data: { meta: { eventType: "type1" }, classAttendance: { url: "", target: "" } } }, 1).category, "timetable", "class attendance metadata identifies a class even when its delegated URL is blank");
   assert.equal(normalizeSchoolboxCalendarEvent({ ...common, resourceId: 12, data: { meta: { type: "Room booking" } } }, 1).category, "resource_booking");
   assert.equal(normalizeSchoolboxCalendarEvent({ ...common, resourceId: 12, data: { meta: { type: "Custom category" } } }, 1).category, "other", "a calendar view resource id alone must not imply a booking");
   assert.equal(normalizeSchoolboxCalendarEvent({ ...common, data: { meta: { type: "School Event" } } }, 1).category, "school_event");
