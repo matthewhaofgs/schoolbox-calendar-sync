@@ -373,11 +373,13 @@ export default function Home() {
     setLoading(false);
   }, []);
 
+  // Session polling replaces the auth object every 30 seconds. Key this
+  // initial load to the stable user ID so routine refreshes preserve drafts.
   useEffect(() => {
-    if (!auth) return;
+    if (!authenticatedUserId) return;
     const timer = window.setTimeout(() => void loadData(), 0);
     return () => window.clearTimeout(timer);
-  }, [auth, loadData]);
+  }, [authenticatedUserId, loadData]);
   useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(null), 5000);
