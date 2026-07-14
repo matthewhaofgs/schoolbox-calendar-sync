@@ -160,9 +160,9 @@ New and upgraded installations initially include every event category and preser
 
 - **Schedule** controls intervals from 15 minutes to daily and a rolling calendar window from today through two years ahead. Relay automatically divides Schoolbox calendar requests into the API's recommended month-sized ranges.
 - **People** controls whether future Google/Schoolbox matches begin enabled or paused.
-- **Google routing** defines the global destination and reusable secondary-calendar names, plus fallback visibility, busy/free state, colour, and reminders. It also supports category-level Google overrides.
-- **Event types** independently controls timetable lessons, resource bookings, school events, individual events, other/custom sources, all-day events, timed events, and completed items.
-- Exact Schoolbox type rules can override source inclusion, destination calendar, visibility, busy/free state, one of Google's event colours, and reminder behaviour. Type rules take priority over category rules, which take priority over the global fallback.
+- **Event rules** combines source coverage and Google routing on one screen. It defines reusable secondary calendars, global Google defaults, category coverage and overrides, exact-type coverage and overrides, and global timed/all-day/completed safeguards.
+- The screen presents the rule order directly: exact Schoolbox type values take priority over category values, which take priority over global defaults. “Inherit” means the setting comes from the preceding level.
+- Exact Schoolbox type rules can override source inclusion, destination calendar, visibility, busy/free state, one of Google's event colours, and reminder behaviour. Global timed/all-day/completed safeguards still apply first.
 - Type labels observed during normal enabled-user syncs become expandable rule editors; Relay does not scan paused users merely to build the catalogue.
 - **Event content** controls descriptions, locations, Schoolbox source links, type and author annotations, and title prefixes.
 - **Connections** exposes the saved Schoolbox URL, delegated Google administrator, Directory customer, time zone, service-account identity, encrypted-secret replacement fields, and both connection tests.

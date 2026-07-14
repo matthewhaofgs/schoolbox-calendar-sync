@@ -4,7 +4,9 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import {
   DEFAULT_SYNC_POLICY,
   EVENT_CATEGORIES,
+  eventTypeKey,
   normalizeSyncPolicy,
+  resolveGoogleEventRule,
   type EventCategory,
   type EventTypeFilterMode,
   type GoogleEventRuleOverride,
@@ -962,7 +964,7 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
   saveConfig: (message?: string) => Promise<boolean>;
   setNotice: (notice: Notice) => void;
 }) {
-  const sections = ["Schedule", "People", "Google routing", "Event types", "Event content", "Connections", "Reconciliation", "Advanced"];
+  const sections = ["Schedule", "People", "Event rules", "Event content", "Connections", "Reconciliation", "Advanced"];
   const [section, setSection] = useState("Schedule");
   const [testing, setTesting] = useState<"schoolbox" | "google" | null>(null);
   const [eventTypes, setEventTypes] = useState<DiscoveredEventType[]>([]);
@@ -992,14 +994,18 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
     setPolicy({ eventTypes: value.split(/\r?\n/).map(item => item.trim()).filter(Boolean) });
   };
   const setCategoryOverride = (category: EventCategory, rule: GoogleEventRuleOverride) => {
-    const next = { ...config.syncPolicy.categoryOverrides };
-    if (Object.keys(rule).length) next[category] = rule; else delete next[category];
-    setPolicy({ categoryOverrides: next });
+    setConfig(current => {
+      const next = { ...current.syncPolicy.categoryOverrides };
+      if (Object.keys(rule).length) next[category] = rule; else delete next[category];
+      return { ...current, syncPolicy: normalizeSyncPolicy({ ...current.syncPolicy, categoryOverrides: next }, current.syncPolicy) };
+    });
   };
   const setTypeOverride = (key: string, rule: GoogleEventRuleOverride) => {
-    const next = { ...config.syncPolicy.eventTypeOverrides };
-    if (Object.keys(rule).length) next[key] = rule; else delete next[key];
-    setPolicy({ eventTypeOverrides: next });
+    setConfig(current => {
+      const next = { ...current.syncPolicy.eventTypeOverrides };
+      if (Object.keys(rule).length) next[key] = rule; else delete next[key];
+      return { ...current, syncPolicy: normalizeSyncPolicy({ ...current.syncPolicy, eventTypeOverrides: next }, current.syncPolicy) };
+    });
   };
   const addCalendar = () => {
     const id = `calendar-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
@@ -1079,6 +1085,23 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
     individual_event: ["Individual events", "Personal or individual calendar items."],
     other: ["Other and custom", "Unclassified or installation-specific sources. Keep enabled unless exact type rules replace it."],
   };
+  const destinationName = (destinationId: string) => destinationId === "primary"
+    ? "Primary calendar"
+    : config.syncPolicy.secondaryCalendars.find(calendar => calendar.id === destinationId)?.name ?? "Unknown destination";
+  const googleRuleSummary = (category: EventCategory, type: string | null) => {
+    const resolved = resolveGoogleEventRule({ category, type }, config.syncPolicy);
+    return `${destinationName(resolved.destinationId)} · ${resolved.transparency === "opaque" ? "Busy" : "Available"}`;
+  };
+  const typeCoverageSummary = (entry: DiscoveredEventType) => {
+    const override = config.syncPolicy.eventTypeOverrides[entry.key];
+    if (override?.enabled === true) return "Included by type";
+    if (override?.enabled === false) return "Excluded by type";
+    if (!config.syncPolicy.categories[entry.category]) return "Excluded by category";
+    if (config.syncPolicy.eventTypeMode === "all") return "Included";
+    const listed = config.syncPolicy.eventTypes.some(type => eventTypeKey(type) === entry.key);
+    if (config.syncPolicy.eventTypeMode === "include") return listed ? "Included by filter" : "Excluded by filter";
+    return listed ? "Excluded by filter" : "Included by filter";
+  };
 
   return <div className="settings-layout">
     <aside className="settings-nav">{sections.map(item => <button type="button" key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item}<span>→</span></button>)}</aside>
@@ -1093,35 +1116,44 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
         <div className="callout warm"><span>i</span><div><b>This changes future discoveries only</b><p>Existing user selections stay as they are. Use People to enable or pause individuals or selected groups.</p></div></div>
       </SettingsSection>}
 
-      {section === "Google routing" && <SettingsSection title="Google calendar routing" intro="Define reusable destinations and category defaults. Exact Schoolbox types can override these choices on the Event types screen.">
-        <div className="callout"><span>i</span><div><b>Primary remains the migration-safe default</b><p>Secondary calendars are created lazily for an enabled user only when an included event targets them. Their names are chosen here rather than hard-coded.</p></div></div>
-        <h3 className="settings-subhead">Default Google behaviour</h3>
-        <div className="form-grid two">
-          <Field label="Default destination"><select value={config.syncPolicy.defaultDestinationId} onChange={e => setPolicy({ defaultDestinationId: e.target.value })}><option value="primary">Primary calendar</option>{config.syncPolicy.secondaryCalendars.map(calendar => <option key={calendar.id} value={calendar.id}>{calendar.name}</option>)}</select></Field>
-          <Field label="Default availability"><select value={config.syncPolicy.transparency} onChange={e => setPolicy({ transparency: e.target.value as SyncPolicy["transparency"] })}><option value="opaque">Busy</option><option value="transparent">Available</option></select></Field>
-          <Field label="Default visibility"><select value={config.syncPolicy.visibility} onChange={e => setPolicy({ visibility: e.target.value as SyncPolicy["visibility"] })}><option value="default">Calendar default</option><option value="private">Private details</option><option value="public">Public details</option></select></Field>
-          <Field label="Default event colour"><select value={config.syncPolicy.colorId} onChange={e => setPolicy({ colorId: e.target.value })}><option value="">Calendar default</option>{CALENDAR_COLOURS.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></Field>
-          <Field label="Default reminders"><select value={config.syncPolicy.reminderMode} onChange={e => setPolicy({ reminderMode: e.target.value as SyncPolicy["reminderMode"] })}><option value="calendar_default">Use calendar defaults</option><option value="none">No reminders</option><option value="custom">One custom reminder</option></select></Field>
-          {config.syncPolicy.reminderMode === "custom" && <Field label="Default custom reminder"><div className="inline-fields"><input type="number" min={0} max={40320} value={config.syncPolicy.reminderMinutes} onChange={e => setPolicy({ reminderMinutes: Number(e.target.value) })} /><select value={config.syncPolicy.reminderMethod} onChange={e => setPolicy({ reminderMethod: e.target.value as SyncPolicy["reminderMethod"] })}><option value="popup">Popup minutes before</option><option value="email">Email minutes before</option></select></div></Field>}
+      {section === "Event rules" && <SettingsSection title="Event rules" intro="Configure what syncs and how each event appears in Google Calendar from one place.">
+        <div className="rule-order" aria-label="Event rule precedence">
+          <div><span>1</span><b>Defaults</b><small>Applied to every included event.</small></div>
+          <i aria-hidden="true">→</i>
+          <div><span>2</span><b>Category</b><small>Overrides defaults for a source category.</small></div>
+          <i aria-hidden="true">→</i>
+          <div><span>3</span><b>Exact type</b><small>Final override for one Schoolbox type.</small></div>
         </div>
-        <h3 className="settings-subhead">Managed secondary calendars</h3>
+        <div className="callout"><span>i</span><div><b>The most specific setting wins</b><p>An exact-type value overrides its category; a category value overrides the default. “Inherit” means use the value from the preceding level. Timed, all-day, and completed-item switches remain global safeguards.</p></div></div>
+
+        <h3 className="settings-subhead">Global coverage safeguards</h3>
+        <div className="policy-grid three"><PolicyToggle checked={config.syncPolicy.includeTimedEvents} onChange={enabled => setPolicy({ includeTimedEvents: enabled })} title="Timed events" detail="Events with start and end times." /><PolicyToggle checked={config.syncPolicy.includeAllDayEvents} onChange={enabled => setPolicy({ includeAllDayEvents: enabled })} title="All-day events" detail="Events represented by dates rather than times." /><PolicyToggle checked={config.syncPolicy.includeCompletedEvents} onChange={enabled => setPolicy({ includeCompletedEvents: enabled })} title="Completed items" detail="Task-like items marked completed in Schoolbox." /></div>
+
+        <h3 className="settings-subhead">Calendar destinations</h3>
+        <div className="settings-note"><span>G</span><div><b>Primary calendar is always available</b><small>Secondary calendars are created lazily for a user only when an included event is routed to them.</small></div></div>
         <div className="calendar-definitions">{config.syncPolicy.secondaryCalendars.map(calendar => <div className="calendar-definition" key={calendar.id}><div className="calendar-definition-head"><div><b>{calendar.name || "Unnamed destination"}</b><small>Relay destination ID: {calendar.id}</small></div><button type="button" className="row-delete" onClick={() => removeCalendar(calendar.id)}>Remove</button></div><div className="form-grid two"><Field label="Calendar name"><input required maxLength={100} value={calendar.name} onChange={e => updateCalendar(calendar.id, { name: e.target.value })} placeholder="Choose a name users will recognise" /></Field><Field label="Description"><input maxLength={500} value={calendar.description} onChange={e => updateCalendar(calendar.id, { description: e.target.value })} placeholder="Optional description" /></Field></div></div>)}</div>
         <button type="button" className="button secondary add-destination" onClick={addCalendar} disabled={config.syncPolicy.secondaryCalendars.length >= 20}>+ Add secondary calendar destination</button>
-        <h3 className="settings-subhead">Category Google defaults</h3>
-        <div className="rule-list">{EVENT_CATEGORIES.map(category => { const rule = config.syncPolicy.categoryOverrides[category] ?? {}; return <details className="rule-card" key={category}><summary><div><b>{categoryCopy[category][0]}</b><small>{categoryCopy[category][1]}</small></div><span>{Object.keys(rule).length ? "Custom rule" : "Uses defaults"}</span></summary><div className="rule-card-body"><EventRuleEditor rule={rule} calendars={config.syncPolicy.secondaryCalendars} onChange={next => setCategoryOverride(category, next)} /></div></details>; })}</div>
-        <div className="callout warm"><span>!</span><div><b>Secondary calendars need one additional delegated scope</b><p>Add <code>{SECONDARY_CALENDAR_SCOPE}</code> to the service account’s domain-wide delegation before assigning one. This scope is limited to calendars created by the app.</p><button type="button" className="text-button" onClick={() => { void navigator.clipboard.writeText(SCOPES.join(",")); setNotice({ kind: "success", message: "All required Google scopes copied." }); }}>Copy complete scope list</button></div></div>
-      </SettingsSection>}
 
-      {section === "Event types" && <SettingsSection title="Event type rules" intro="Control source coverage, destination, availability, visibility, colour, and reminders for exact Schoolbox types.">
-        <h3 className="settings-subhead">Source categories</h3>
-        <div className="policy-grid">{EVENT_CATEGORIES.map(category => <PolicyToggle key={category} checked={config.syncPolicy.categories[category]} onChange={enabled => setCategory(category, enabled)} title={categoryCopy[category][0]} detail={categoryCopy[category][1]} />)}</div>
-        <h3 className="settings-subhead">Time and completion filters</h3>
-        <div className="policy-grid three"><PolicyToggle checked={config.syncPolicy.includeTimedEvents} onChange={enabled => setPolicy({ includeTimedEvents: enabled })} title="Timed events" detail="Events with start and end times." /><PolicyToggle checked={config.syncPolicy.includeAllDayEvents} onChange={enabled => setPolicy({ includeAllDayEvents: enabled })} title="All-day events" detail="Events represented by dates rather than times." /><PolicyToggle checked={config.syncPolicy.includeCompletedEvents} onChange={enabled => setPolicy({ includeCompletedEvents: enabled })} title="Completed items" detail="Task-like items marked completed in Schoolbox." /></div>
+        <h3 className="settings-subhead">Default Google behaviour</h3>
+        <p className="settings-section-copy">This is the fallback for every included event. Category and exact-type cards below show their effective destination and availability.</p>
+        <div className="form-grid two">
+          <Field label="Destination"><select value={config.syncPolicy.defaultDestinationId} onChange={e => setPolicy({ defaultDestinationId: e.target.value })}><option value="primary">Primary calendar</option>{config.syncPolicy.secondaryCalendars.map(calendar => <option key={calendar.id} value={calendar.id}>{calendar.name}</option>)}</select></Field>
+          <Field label="Availability"><select value={config.syncPolicy.transparency} onChange={e => setPolicy({ transparency: e.target.value as SyncPolicy["transparency"] })}><option value="opaque">Busy</option><option value="transparent">Available</option></select></Field>
+          <Field label="Visibility"><select value={config.syncPolicy.visibility} onChange={e => setPolicy({ visibility: e.target.value as SyncPolicy["visibility"] })}><option value="default">Calendar default</option><option value="private">Private details</option><option value="public">Public details</option></select></Field>
+          <Field label="Event colour"><select value={config.syncPolicy.colorId} onChange={e => setPolicy({ colorId: e.target.value })}><option value="">Calendar default</option>{CALENDAR_COLOURS.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></Field>
+          <Field label="Reminders"><select value={config.syncPolicy.reminderMode} onChange={e => setPolicy({ reminderMode: e.target.value as SyncPolicy["reminderMode"] })}><option value="calendar_default">Use calendar defaults</option><option value="none">No reminders</option><option value="custom">One custom reminder</option></select></Field>
+          {config.syncPolicy.reminderMode === "custom" && <Field label="Custom reminder"><div className="inline-fields"><input type="number" min={0} max={40320} value={config.syncPolicy.reminderMinutes} onChange={e => setPolicy({ reminderMinutes: Number(e.target.value) })} /><select value={config.syncPolicy.reminderMethod} onChange={e => setPolicy({ reminderMethod: e.target.value as SyncPolicy["reminderMethod"] })}><option value="popup">Popup minutes before</option><option value="email">Email minutes before</option></select></div></Field>}
+        </div>
+
+        <h3 className="settings-subhead">Category rules</h3>
+        <p className="settings-section-copy">Turn a whole category on or off, then optionally override its Google behaviour. The summary shows the effective result.</p>
+        <div className="rule-list">{EVENT_CATEGORIES.map(category => { const rule = config.syncPolicy.categoryOverrides[category] ?? {}; const included = config.syncPolicy.categories[category]; return <details className="rule-card" key={category}><summary><div><b>{categoryCopy[category][0]}</b><small>{Object.keys(rule).length ? "Custom category behaviour" : "Inherits Google defaults"}</small></div><span className="rule-card-state"><b>{included ? "Included" : "Excluded"}</b><small>{googleRuleSummary(category, null)}</small></span></summary><div className="rule-card-body category-rule-body"><PolicyToggle checked={included} onChange={enabled => setCategory(category, enabled)} title="Include this category" detail={categoryCopy[category][1]} /><EventRuleEditor rule={rule} calendars={config.syncPolicy.secondaryCalendars} onChange={next => setCategoryOverride(category, next)} /></div></details>; })}</div>
+
         <h3 className="settings-subhead">Exact Schoolbox type rules</h3>
-        <div className="form-grid two"><Field label="Rule mode"><select value={config.syncPolicy.eventTypeMode} onChange={e => setPolicy({ eventTypeMode: e.target.value as EventTypeFilterMode })}><option value="all">Include every type</option><option value="include">Only include listed types</option><option value="exclude">Include all except listed types</option></select></Field><Field label="Type labels" hint="One exact Schoolbox type label per line; matching is case-insensitive."><textarea rows={5} value={typeRuleText} onChange={e => updateTypeRules(e.target.value)} disabled={config.syncPolicy.eventTypeMode === "all"} placeholder={config.syncPolicy.eventTypeMode === "include" ? "Timetable\nExcursion" : "Private appointment"} /></Field></div>
-        <h3 className="settings-subhead">Detected type behaviour</h3>
-        {eventTypes.length ? <div className="rule-list">{eventTypes.map(entry => { const rule = config.syncPolicy.eventTypeOverrides[entry.key] ?? {}; return <details className="rule-card" key={entry.key}><summary><div><b>{entry.label}</b><small>{categoryCopy[entry.category]?.[0] ?? "Other and custom"}</small></div><span>{Object.keys(rule).length ? "Custom rule" : "Uses category"}</span></summary><div className="rule-card-body"><EventRuleEditor rule={rule} calendars={config.syncPolicy.secondaryCalendars} onChange={next => setTypeOverride(entry.key, next)} allowCoverage /></div></details>; })}</div> : <div className="detected-types"><div><b>No type labels have been catalogued yet</b><small>Run a pilot sync for an enabled user. Relay records only the type labels needed for configuration; this screen does not show user or event details.</small></div></div>}
-        <div className="callout warm"><span>!</span><div><b>Rule order is exact type → category → default</b><p>Timed/all-day and completion filters remain global safeguards. A type-level Sync setting can override category and global exact-type coverage; Reconciliation controls removal of events newly excluded by a rule.</p></div></div>
+        <p className="settings-section-copy">For most installations, include every type here and use each detected type card to make exceptions. The manual list remains available for types not yet detected.</p>
+        <div className="form-grid two"><Field label="Baseline type coverage"><select value={config.syncPolicy.eventTypeMode} onChange={e => setPolicy({ eventTypeMode: e.target.value as EventTypeFilterMode })}><option value="all">Use category coverage for every type</option><option value="include">Only include manually listed types</option><option value="exclude">Exclude manually listed types</option></select></Field><Field label="Manual type list" hint="One exact Schoolbox type label per line. Exact type cards below take precedence."><textarea rows={5} value={typeRuleText} onChange={e => updateTypeRules(e.target.value)} disabled={config.syncPolicy.eventTypeMode === "all"} placeholder={config.syncPolicy.eventTypeMode === "include" ? "Timetable\nExcursion" : "Private appointment"} /></Field></div>
+        {eventTypes.length ? <div className="rule-list">{eventTypes.map(entry => { const rule = config.syncPolicy.eventTypeOverrides[entry.key] ?? {}; return <details className="rule-card" key={entry.key}><summary><div><b>{entry.label}</b><small>{categoryCopy[entry.category]?.[0] ?? "Other and custom"} · {Object.keys(rule).length ? "Custom exact rule" : "Inherits category"}</small></div><span className="rule-card-state"><b>{typeCoverageSummary(entry)}</b><small>{googleRuleSummary(entry.category, entry.label)}</small></span></summary><div className="rule-card-body"><EventRuleEditor rule={rule} calendars={config.syncPolicy.secondaryCalendars} onChange={next => setTypeOverride(entry.key, next)} allowCoverage /></div></details>; })}</div> : <div className="detected-types"><div><b>No type labels have been catalogued yet</b><small>Run a pilot sync for an enabled user. Relay records only the type labels needed for configuration; this screen does not show user or event details.</small></div></div>}
+        <div className="callout warm"><span>!</span><div><b>Secondary calendars need one additional delegated scope</b><p>Add <code>{SECONDARY_CALENDAR_SCOPE}</code> to the service account’s domain-wide delegation before assigning one. This scope is limited to calendars created by the app.</p><button type="button" className="text-button" onClick={() => { void navigator.clipboard.writeText(SCOPES.join(",")); setNotice({ kind: "success", message: "All required Google scopes copied." }); }}>Copy complete scope list</button></div></div>
       </SettingsSection>}
 
       {section === "Event content" && <SettingsSection title="Event content" intro="Choose what Relay copies from Schoolbox into each managed Google event.">
@@ -1129,7 +1161,7 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
         <div className="policy-grid"><PolicyToggle checked={config.syncPolicy.includeDescription} onChange={enabled => setPolicy({ includeDescription: enabled })} title="Description" detail="Copy the plain-text Schoolbox event detail." /><PolicyToggle checked={config.syncPolicy.includeLocation} onChange={enabled => setPolicy({ includeLocation: enabled })} title="Location" detail="Copy room or location metadata." /><PolicyToggle checked={config.syncPolicy.includeSchoolboxLink} onChange={enabled => setPolicy({ includeSchoolboxLink: enabled })} title="Schoolbox link" detail="Add an Open in Schoolbox source link." /><PolicyToggle checked={config.syncPolicy.includeEventTypeInDescription} onChange={enabled => setPolicy({ includeEventTypeInDescription: enabled })} title="Type in description" detail="Append the Schoolbox type label." /><PolicyToggle checked={config.syncPolicy.includeAuthorInDescription} onChange={enabled => setPolicy({ includeAuthorInDescription: enabled })} title="Author in description" detail="Append the source author when supplied." /></div>
         <h3 className="settings-subhead">Title</h3>
         <Field label="Title prefix" hint="Up to 40 characters; leave blank for the original title."><input maxLength={40} value={config.syncPolicy.titlePrefix} onChange={e => setPolicy({ titlePrefix: e.target.value })} placeholder="[Schoolbox]" /></Field>
-        <div className="settings-note"><span>i</span><div><b>Google appearance now follows layered rules</b><small>Configure destination, availability, visibility, colour, and reminders under Google routing and exact Event types.</small></div></div>
+        <div className="settings-note"><span>i</span><div><b>Google appearance follows the event-rule hierarchy</b><small>Configure destination, availability, visibility, colour, and reminders together under Event rules.</small></div></div>
       </SettingsSection>}
 
       {section === "Connections" && <SettingsSection title="Connected services" intro="Review or replace every connection value configured during setup. Stored secrets are never revealed.">
