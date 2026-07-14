@@ -1,6 +1,14 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  DEFAULT_SYNC_POLICY,
+  EVENT_CATEGORIES,
+  normalizeSyncPolicy,
+  type EventCategory,
+  type EventTypeFilterMode,
+  type SyncPolicy,
+} from "@/lib/policy";
 
 type View = "dashboard" | "setup" | "people" | "runs" | "settings" | "access";
 type Notice = { kind: "success" | "error" | "info"; message: string } | null;
@@ -176,7 +184,7 @@ export default function Home() {
   const [loginMessage, setLoginMessage] = useState("");
   const [sessionClock, setSessionClock] = useState(() => Date.now());
   const [extendingSession, setExtendingSession] = useState(false);
-  const [config, setConfig] = useState({
+  const [config, setConfig] = useState<Config>({
     schoolboxUrl: "",
     schoolboxJwt: "",
     serviceAccountJson: "",
@@ -185,9 +193,15 @@ export default function Home() {
     pastDays: "30",
     futureDays: "180",
     syncNewUsersByDefault: false,
+    googleCustomer: "my_customer",
+    timezone: "Australia/Sydney",
+    concurrency: "3",
+    enabled: false,
     hasSchoolboxToken: false,
     hasGoogleServiceAccount: false,
+    serviceAccountEmail: "",
     serviceAccountClientId: "",
+    syncPolicy: normalizeSyncPolicy({}, DEFAULT_SYNC_POLICY),
   });
 
   const canOperate = Boolean(auth?.permissions.includes("operate"));
@@ -295,6 +309,9 @@ export default function Home() {
         pastDays: String(statusConfig.pastDays ?? current.pastDays),
         futureDays: String(statusConfig.futureDays ?? current.futureDays),
         syncNewUsersByDefault: Boolean(statusConfig.syncNewUsersByDefault ?? current.syncNewUsersByDefault),
+        timezone: String(statusConfig.timezone ?? current.timezone),
+        enabled: Boolean(statusConfig.enabled ?? current.enabled),
+        syncPolicy: normalizeSyncPolicy(statusConfig.syncPolicy, current.syncPolicy),
       }));
       const fetchedPeople = normalisePeople(payload.people ?? payload.users);
       const fetchedRuns = normaliseRuns(payload.runs ?? payload.history ?? (payload.lastRun ? [payload.lastRun] : null));
@@ -315,9 +332,15 @@ export default function Home() {
         pastDays: String(incoming.pastDays ?? incoming.past_days ?? current.pastDays),
         futureDays: String(incoming.futureDays ?? incoming.future_days ?? current.futureDays),
         syncNewUsersByDefault: Boolean(incoming.syncNewUsersByDefault ?? current.syncNewUsersByDefault),
+        googleCustomer: String(incoming.googleCustomer ?? current.googleCustomer),
+        timezone: String(incoming.timezone ?? current.timezone),
+        concurrency: String(incoming.concurrency ?? current.concurrency),
+        enabled: Boolean(incoming.enabled ?? current.enabled),
         hasSchoolboxToken: Boolean(incoming.hasSchoolboxToken ?? current.hasSchoolboxToken),
         hasGoogleServiceAccount: Boolean(incoming.hasGoogleServiceAccount ?? current.hasGoogleServiceAccount),
+        serviceAccountEmail: String(incoming.serviceAccountEmail ?? current.serviceAccountEmail),
         serviceAccountClientId: String(incoming.serviceAccountClientId ?? current.serviceAccountClientId),
+        syncPolicy: normalizeSyncPolicy(incoming.syncPolicy, current.syncPolicy),
       }));
     }
     if (diagnosticResult.status === "fulfilled") {
@@ -379,7 +402,7 @@ export default function Home() {
     }
   };
 
-  const saveConfig = async (message = "Settings saved") => {
+  const saveConfig = async (message = "Settings saved", forceEnabled?: boolean) => {
     try {
       const saved = await fetchJson("/api/config", {
         method: "PUT",
@@ -392,9 +415,12 @@ export default function Home() {
           pastDays: Number(config.pastDays),
           futureDays: Number(config.futureDays),
           syncNewUsersByDefault: config.syncNewUsersByDefault,
-          enabled: true,
+          syncPolicy: config.syncPolicy,
+          googleCustomer: config.googleCustomer,
+          concurrency: Number(config.concurrency),
+          enabled: forceEnabled ?? config.enabled,
           setupCompleted: true,
-          timezone: "Australia/Sydney",
+          timezone: config.timezone,
         }),
       });
       setApiOnline(true);
@@ -405,10 +431,16 @@ export default function Home() {
         serviceAccountJson: "",
         hasSchoolboxToken: Boolean(saved.hasSchoolboxToken ?? (current.hasSchoolboxToken || Boolean(current.schoolboxJwt))),
         hasGoogleServiceAccount: Boolean(saved.hasGoogleServiceAccount ?? (current.hasGoogleServiceAccount || Boolean(current.serviceAccountJson))),
+        serviceAccountEmail: String(saved.serviceAccountEmail ?? current.serviceAccountEmail),
         serviceAccountClientId: String(saved.serviceAccountClientId ?? (() => {
           try { return JSON.parse(current.serviceAccountJson || "{}").client_id ?? current.serviceAccountClientId; }
           catch { return current.serviceAccountClientId; }
         })()),
+        googleCustomer: String(saved.googleCustomer ?? current.googleCustomer),
+        timezone: String(saved.timezone ?? current.timezone),
+        concurrency: String(saved.concurrency ?? current.concurrency),
+        enabled: Boolean(saved.enabled ?? current.enabled),
+        syncPolicy: normalizeSyncPolicy(saved.syncPolicy, current.syncPolicy),
       }));
       setNotice({ kind: "success", message });
       return true;
@@ -509,7 +541,7 @@ export default function Home() {
           {view === "setup" && canConfigure && <SetupWizard configured={configured} config={config} setConfig={setConfig} saveConfig={saveConfig} setNotice={setNotice} changeView={changeView} />}
           {view === "people" && <PeoplePage people={people} setPeople={setPeople} counts={counts} loadError={resourceErrors.people} canConfigure={canConfigure} setNotice={setNotice} />}
           {view === "runs" && <RunsPage runs={runs} selectedRun={selectedRun} setSelectedRun={setSelectedRun} runNow={runNow} syncRunning={syncRunning} canOperate={canOperate} loadError={resourceErrors.runs} />}
-          {view === "settings" && canConfigure && <SettingsPage config={config} setConfig={setConfig} saveConfig={saveConfig} />}
+          {view === "settings" && canConfigure && <SettingsPage config={config} setConfig={setConfig} saveConfig={saveConfig} setNotice={setNotice} />}
           {view === "access" && canManageAccess && <AccessPage canChangeLocalPassword={auth.isOwner && auth.authType === "local"} setNotice={setNotice} onSignedOut={handleSignedOut} />}
         </div>
       </main>
@@ -578,6 +610,8 @@ function Dashboard({ people, runs, counts, lastSync, health, apiOnline, configur
   const attention = health.toLowerCase().includes("fail") || health.toLowerCase().includes("warning");
   const healthTitle = !apiOnline ? "Service unavailable" : !configured ? "Setup is not complete" : attention ? "Attention needed" : latestRun ? "Synchronization is healthy" : "Ready for the first sync";
   const healthTone = !apiOnline || attention ? "danger" : configured ? "success" : "warning";
+  const coverageLabels: Record<EventCategory, string> = { timetable: "Timetable", resource_booking: "Resource bookings", school_event: "School events", individual_event: "Individual events", other: "Other/custom" };
+  const enabledCategories = EVENT_CATEGORIES.filter(category => config.syncPolicy.categories[category]);
   return <>
     <section className={`health-banner ${healthTone}`}>
       <div className="health-orbit"><span>{healthTone === "success" ? "✓" : "!"}</span></div>
@@ -603,8 +637,8 @@ function Dashboard({ people, runs, counts, lastSync, health, apiOnline, configur
         </div> : <div className="empty-state compact"><b>{runsError ? "Activity could not be loaded" : "No activity yet"}</b><p>{runsError ? "Refresh after checking the server logs." : "Run the first sync to populate this chart."}</p></div>}
       </div>
       <div className="panel coverage-panel">
-        <PanelHead title="Calendar coverage" subtitle="Schoolbox content included in every sync" />
-        <div className="coverage-checks"><span><i>✓</i>Timetable lessons</span><span><i>✓</i>Resource bookings</span><span><i>✓</i>School and individual events</span></div>
+        <PanelHead title="Calendar coverage" subtitle="Current event policy for enabled users" />
+        <div className="coverage-checks">{enabledCategories.length ? enabledCategories.map(category => <span key={category}><i>✓</i>{coverageLabels[category]}</span>) : <span><i>!</i>No source categories enabled</span>}<span><i>{config.syncPolicy.eventTypeMode === "all" ? "✓" : "≡"}</i>{config.syncPolicy.eventTypeMode === "all" ? "All exact types" : config.syncPolicy.eventTypeMode === "include" ? `${config.syncPolicy.eventTypes.length} allowed type(s)` : `${config.syncPolicy.eventTypes.length} excluded type(s)`}</span></div>
         <div className="window-note"><span aria-hidden="true">↔</span><div><b>{Number(config.pastDays) + Number(config.futureDays)}-day rolling window</b><small>{config.pastDays} days back · {config.futureDays} days ahead</small></div></div>
       </div>
     </section>
@@ -642,12 +676,25 @@ type Config = {
   pastDays: string;
   futureDays: string;
   syncNewUsersByDefault: boolean;
+  googleCustomer: string;
+  timezone: string;
+  concurrency: string;
+  enabled: boolean;
   hasSchoolboxToken: boolean;
   hasGoogleServiceAccount: boolean;
+  serviceAccountEmail: string;
   serviceAccountClientId: string;
+  syncPolicy: SyncPolicy;
 };
 
-function SetupWizard({ configured, config, setConfig, saveConfig, setNotice, changeView }: { configured: boolean; config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; saveConfig: (message?: string) => Promise<boolean>; setNotice: (notice: Notice) => void; changeView: (view: View) => void }) {
+type DiscoveredEventType = {
+  key: string;
+  label: string;
+  category: EventCategory;
+  lastSeenAt: string;
+};
+
+function SetupWizard({ configured, config, setConfig, saveConfig, setNotice, changeView }: { configured: boolean; config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; saveConfig: (message?: string, forceEnabled?: boolean) => Promise<boolean>; setNotice: (notice: Notice) => void; changeView: (view: View) => void }) {
   const [step, setStep] = useState(1);
   const [testing, setTesting] = useState<"schoolbox" | "google" | null>(null);
   const [schoolboxTested, setSchoolboxTested] = useState(false);
@@ -688,7 +735,7 @@ function SetupWizard({ configured, config, setConfig, saveConfig, setNotice, cha
       setNotice({ kind: "error", message: "Verify both Schoolbox and Google Workspace before activating Relay." });
       return;
     }
-    if (await saveConfig("Setup complete. Relay is ready for its first sync.")) setFinished(true);
+    if (await saveConfig("Setup complete. Relay is ready for its first sync.", true)) setFinished(true);
   };
 
   if (finished) return <section className="setup-complete"><div className="completion-mark">✓</div><p className="eyebrow">Connections complete</p><h2>Relay is ready to move.</h2><p>Your settings are saved. The first run will discover everyone and sync only users enabled by your coverage policy.</p><div className="finish-summary"><span><b>Schoolbox</b><small>{config.schoolboxUrl}</small></span><span><b>Google Workspace</b><small>{config.adminEmail}</small></span><span><b>New users</b><small>{config.syncNewUsersByDefault ? "Enabled automatically" : "Paused for review"}</small></span></div><button className="button primary" onClick={() => changeView("dashboard")}>Go to overview <span>→</span></button></section>;
@@ -896,17 +943,136 @@ function RunsPage({ runs, selectedRun, setSelectedRun, runNow, syncRunning, canO
   </div>;
 }
 
-function SettingsPage({ config, setConfig, saveConfig }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; saveConfig: (message?: string) => Promise<boolean> }) {
+function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
+  config: Config;
+  setConfig: React.Dispatch<React.SetStateAction<Config>>;
+  saveConfig: (message?: string) => Promise<boolean>;
+  setNotice: (notice: Notice) => void;
+}) {
+  const sections = ["Schedule", "People", "Event types", "Calendar content", "Connections", "Reconciliation", "Advanced"];
   const [section, setSection] = useState("Schedule");
+  const [testing, setTesting] = useState<"schoolbox" | "google" | null>(null);
+  const [eventTypes, setEventTypes] = useState<DiscoveredEventType[]>([]);
+  const [typeRuleText, setTypeRuleText] = useState(() => config.syncPolicy.eventTypes.join("\n"));
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchJson("/api/event-types").then((payload) => {
+      if (!cancelled) setEventTypes((payload.eventTypes as DiscoveredEventType[] | undefined) ?? []);
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  const setPolicy = (update: Partial<SyncPolicy>) => setConfig(current => ({
+    ...current,
+    syncPolicy: normalizeSyncPolicy({ ...current.syncPolicy, ...update }, current.syncPolicy),
+  }));
+  const setCategory = (category: EventCategory, enabled: boolean) => setConfig(current => ({
+    ...current,
+    syncPolicy: normalizeSyncPolicy({
+      ...current.syncPolicy,
+      categories: { ...current.syncPolicy.categories, [category]: enabled },
+    }, current.syncPolicy),
+  }));
+  const updateTypeRules = (value: string) => {
+    setTypeRuleText(value);
+    setPolicy({ eventTypes: value.split(/\r?\n/).map(item => item.trim()).filter(Boolean) });
+  };
+  const toggleDetectedType = (entry: DiscoveredEventType) => {
+    const exists = config.syncPolicy.eventTypes.some(label => label.toLocaleLowerCase("en-AU") === entry.key);
+    const next = exists
+      ? config.syncPolicy.eventTypes.filter(label => label.toLocaleLowerCase("en-AU") !== entry.key)
+      : [...config.syncPolicy.eventTypes, entry.label];
+    const mode = config.syncPolicy.eventTypeMode === "all" ? "exclude" : config.syncPolicy.eventTypeMode;
+    setTypeRuleText(next.join("\n"));
+    setPolicy({ eventTypeMode: mode, eventTypes: next });
+  };
+  const testConnection = async (target: "schoolbox" | "google") => {
+    setTesting(target);
+    try {
+      const payload = await fetchJson("/api/diagnostics", {
+        method: "POST",
+        body: JSON.stringify({ target, config: {
+          schoolboxUrl: config.schoolboxUrl,
+          schoolboxJwt: config.schoolboxJwt,
+          serviceAccountJson: config.serviceAccountJson,
+          adminEmail: config.adminEmail,
+        } }),
+      });
+      setNotice({ kind: "success", message: String(payload.message ?? `${target === "schoolbox" ? "Schoolbox" : "Google Workspace"} connection verified.`) });
+    } catch (error) {
+      setNotice({ kind: "error", message: error instanceof Error ? error.message : "The connection check failed." });
+    } finally {
+      setTesting(null);
+    }
+  };
   const submit = (event: FormEvent) => { event.preventDefault(); void saveConfig(); };
-  return <div className="settings-layout"><aside className="settings-nav">{["Schedule", "People", "Calendar content", "Connections", "Advanced"].map(item => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item}<span>→</span></button>)}</aside><form className="panel settings-card" onSubmit={submit}>
-    {section === "Schedule" && <SettingsSection title="Sync schedule" intro="Choose how frequently Relay checks Schoolbox and the calendar window it maintains."><div className="form-grid"><Field label="Frequency"><select value={config.interval} onChange={e => setConfig(c => ({ ...c, interval: e.target.value }))}><option value="15">Every 15 minutes</option><option value="30">Every 30 minutes</option><option value="60">Every hour</option><option value="360">Every 6 hours</option></select></Field><Field label="Keep past events"><select value={config.pastDays} onChange={e => setConfig(c => ({ ...c, pastDays: e.target.value }))}><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option></select></Field><Field label="Sync ahead"><select value={config.futureDays} onChange={e => setConfig(c => ({ ...c, futureDays: e.target.value }))}><option value="90">90 days</option><option value="180">180 days</option><option value="365">1 year</option></select></Field></div><div className="settings-note"><span>◷</span><div><b>Next run follows the configured interval</b><small>Runs use the Australia/Sydney time zone.</small></div></div></SettingsSection>}
-    {section === "People" && <SettingsSection title="New-user coverage" intro="Choose what happens the first time Relay discovers a Google Workspace user."><label className="policy-choice"><input type="checkbox" checked={config.syncNewUsersByDefault} onChange={e => setConfig(c => ({ ...c, syncNewUsersByDefault: e.target.checked }))} /><span><b>Automatically enable newly discovered users</b><small>{config.syncNewUsersByDefault ? "Newly matched people will be included in the next calendar sync." : "New users will appear under People as paused until an administrator enables them."}</small></span></label><div className="callout warm"><span>i</span><div><b>This changes future discoveries only</b><p>Existing user selections stay as they are. Use People to enable or pause individuals or a selected group.</p></div></div></SettingsSection>}
-    {section === "Calendar content" && <SettingsSection title="Calendar content" intro="Relay mirrors the complete calendar feed Schoolbox exposes for each user."><div className="callout"><span>✓</span><div><b>Everything relevant is included</b><p>Timetable lessons, rooms, resource bookings, school events and individual events are synced. Relay only removes Google events it owns.</p></div></div></SettingsSection>}
-    {section === "Connections" && <SettingsSection title="Connected services" intro="Review the identities Relay uses. Secrets are encrypted and cannot be revealed."><div className="connection-row"><span className="connection-logo">S</span><div><b>Schoolbox</b><small>{config.schoolboxUrl || "Complete Setup to connect"}</small></div><span className={`status-pill ${config.schoolboxUrl ? "success" : "warning"}`}><i />{config.schoolboxUrl ? "Connected" : "Not configured"}</span></div><div className="connection-row"><span className="connection-logo google">G</span><div><b>Google Workspace</b><small>{config.adminEmail || "Complete Setup to delegate access"}</small></div><span className={`status-pill ${config.adminEmail ? "success" : "warning"}`}><i />{config.adminEmail ? "Delegated" : "Not configured"}</span></div><div className="callout warm"><span>!</span><div><b>Rotate credentials from Setup</b><p>Re-run the connection tests before saving replacements. Existing Google Calendar events remain untouched.</p></div></div></SettingsSection>}
-    {section === "Advanced" && <SettingsSection title="Advanced controls" intro="Operational safeguards for large organisations."><div className="callout"><span>✓</span><div><b>Safeguards are always active</b><p>Temporary API failures use exponential backoff, and Relay never modifies manually-created Google events.</p></div></div></SettingsSection>}
-    <div className="settings-actions"><span>Changes take effect on the next run.</span><button className="button primary" type="submit">Save changes</button></div>
-  </form></div>;
+  const categoryCopy: Record<EventCategory, [string, string]> = {
+    timetable: ["Timetable lessons", "Classes and lessons identified by Schoolbox timetable metadata."],
+    resource_booking: ["Resource bookings", "Rooms, equipment and other resource-linked bookings."],
+    school_event: ["School events", "Items explicitly labelled as school-wide events."],
+    individual_event: ["Individual events", "Personal or individual calendar items."],
+    other: ["Other and custom", "Unclassified or installation-specific sources. Keep enabled unless exact type rules replace it."],
+  };
+
+  return <div className="settings-layout">
+    <aside className="settings-nav">{sections.map(item => <button type="button" key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item}<span>→</span></button>)}</aside>
+    <form className="panel settings-card" onSubmit={submit}>
+      {section === "Schedule" && <SettingsSection title="Sync schedule" intro="Choose how frequently Relay checks Schoolbox and the rolling calendar window it maintains.">
+        <div className="form-grid"><Field label="Frequency"><select value={config.interval} onChange={e => setConfig(c => ({ ...c, interval: e.target.value }))}><option value="15">Every 15 minutes</option><option value="30">Every 30 minutes</option><option value="60">Every hour</option><option value="180">Every 3 hours</option><option value="360">Every 6 hours</option><option value="720">Every 12 hours</option><option value="1440">Daily</option></select></Field><Field label="Keep past events"><select value={config.pastDays} onChange={e => setConfig(c => ({ ...c, pastDays: e.target.value }))}><option value="0">From today</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option><option value="60">60 days</option><option value="90">90 days</option><option value="180">180 days</option><option value="365">1 year</option></select></Field><Field label="Sync ahead"><select value={config.futureDays} onChange={e => setConfig(c => ({ ...c, futureDays: e.target.value }))}><option value="30">30 days</option><option value="60">60 days</option><option value="90">90 days</option><option value="180">180 days</option><option value="365">1 year</option><option value="730">2 years</option></select></Field></div>
+        <div className="settings-note"><span>◷</span><div><b>{Number(config.pastDays) + Number(config.futureDays)}-day rolling window</b><small>Schoolbox requests are automatically split into month-sized ranges.</small></div></div>
+      </SettingsSection>}
+
+      {section === "People" && <SettingsSection title="New-user coverage" intro="Choose what happens the first time Relay discovers a Google Workspace user.">
+        <PolicyToggle checked={config.syncNewUsersByDefault} onChange={enabled => setConfig(c => ({ ...c, syncNewUsersByDefault: enabled }))} title="Automatically enable newly discovered users" detail={config.syncNewUsersByDefault ? "Newly matched people join calendar sync immediately." : "New users appear under People as paused until an administrator enables them."} />
+        <div className="callout warm"><span>i</span><div><b>This changes future discoveries only</b><p>Existing user selections stay as they are. Use People to enable or pause individuals or selected groups.</p></div></div>
+      </SettingsSection>}
+
+      {section === "Event types" && <SettingsSection title="Event type coverage" intro="Control which parts of each enabled user’s Schoolbox calendar Relay writes to Google.">
+        <h3 className="settings-subhead">Source categories</h3>
+        <div className="policy-grid">{EVENT_CATEGORIES.map(category => <PolicyToggle key={category} checked={config.syncPolicy.categories[category]} onChange={enabled => setCategory(category, enabled)} title={categoryCopy[category][0]} detail={categoryCopy[category][1]} />)}</div>
+        <h3 className="settings-subhead">Time and completion filters</h3>
+        <div className="policy-grid three"><PolicyToggle checked={config.syncPolicy.includeTimedEvents} onChange={enabled => setPolicy({ includeTimedEvents: enabled })} title="Timed events" detail="Events with start and end times." /><PolicyToggle checked={config.syncPolicy.includeAllDayEvents} onChange={enabled => setPolicy({ includeAllDayEvents: enabled })} title="All-day events" detail="Events represented by dates rather than times." /><PolicyToggle checked={config.syncPolicy.includeCompletedEvents} onChange={enabled => setPolicy({ includeCompletedEvents: enabled })} title="Completed items" detail="Task-like items marked completed in Schoolbox." /></div>
+        <h3 className="settings-subhead">Exact Schoolbox type rules</h3>
+        <div className="form-grid two"><Field label="Rule mode"><select value={config.syncPolicy.eventTypeMode} onChange={e => setPolicy({ eventTypeMode: e.target.value as EventTypeFilterMode })}><option value="all">Include every type</option><option value="include">Only include listed types</option><option value="exclude">Include all except listed types</option></select></Field><Field label="Type labels" hint="One exact Schoolbox type label per line; matching is case-insensitive."><textarea rows={5} value={typeRuleText} onChange={e => updateTypeRules(e.target.value)} disabled={config.syncPolicy.eventTypeMode === "all"} placeholder={config.syncPolicy.eventTypeMode === "include" ? "Timetable\nExcursion" : "Private appointment"} /></Field></div>
+        <div className="detected-types"><div><b>Detected type labels</b><small>Populated during normal syncs of enabled users; paused calendars are not scanned.</small></div>{eventTypes.length ? <div className="type-chip-list">{eventTypes.map(entry => { const selected = config.syncPolicy.eventTypes.some(label => label.toLocaleLowerCase("en-AU") === entry.key); return <button type="button" className={selected ? "selected" : ""} key={entry.key} onClick={() => toggleDetectedType(entry)}>{selected ? "✓ " : "+ "}{entry.label}<small>{categoryCopy[entry.category]?.[0] ?? "Other"}</small></button>; })}</div> : <p>No type labels have been catalogued yet.</p>}</div>
+        <div className="callout warm"><span>!</span><div><b>Filtered events follow the reconciliation policy</b><p>If a source, time form, completion state, or exact type excludes an item, Reconciliation decides whether its existing Relay-managed Google event is removed or retained.</p></div></div>
+      </SettingsSection>}
+
+      {section === "Calendar content" && <SettingsSection title="Google Calendar content" intro="Choose what Relay copies into each managed event and how those events appear.">
+        <h3 className="settings-subhead">Copied fields</h3>
+        <div className="policy-grid"><PolicyToggle checked={config.syncPolicy.includeDescription} onChange={enabled => setPolicy({ includeDescription: enabled })} title="Description" detail="Copy the plain-text Schoolbox event detail." /><PolicyToggle checked={config.syncPolicy.includeLocation} onChange={enabled => setPolicy({ includeLocation: enabled })} title="Location" detail="Copy room or location metadata." /><PolicyToggle checked={config.syncPolicy.includeSchoolboxLink} onChange={enabled => setPolicy({ includeSchoolboxLink: enabled })} title="Schoolbox link" detail="Add an Open in Schoolbox source link." /><PolicyToggle checked={config.syncPolicy.includeEventTypeInDescription} onChange={enabled => setPolicy({ includeEventTypeInDescription: enabled })} title="Type in description" detail="Append the Schoolbox type label." /><PolicyToggle checked={config.syncPolicy.includeAuthorInDescription} onChange={enabled => setPolicy({ includeAuthorInDescription: enabled })} title="Author in description" detail="Append the source author when supplied." /></div>
+        <h3 className="settings-subhead">Display and privacy</h3>
+        <div className="form-grid"><Field label="Title prefix" hint="Up to 40 characters; leave blank for the original title."><input maxLength={40} value={config.syncPolicy.titlePrefix} onChange={e => setPolicy({ titlePrefix: e.target.value })} placeholder="[Schoolbox]" /></Field><Field label="Visibility"><select value={config.syncPolicy.visibility} onChange={e => setPolicy({ visibility: e.target.value as SyncPolicy["visibility"] })}><option value="default">Calendar default</option><option value="private">Private details</option><option value="public">Public details</option></select></Field><Field label="Availability"><select value={config.syncPolicy.transparency} onChange={e => setPolicy({ transparency: e.target.value as SyncPolicy["transparency"] })}><option value="opaque">Busy</option><option value="transparent">Available</option></select></Field></div>
+        <div className="form-grid"><Field label="Event colour"><select value={config.syncPolicy.colorId} onChange={e => setPolicy({ colorId: e.target.value })}><option value="">Calendar default</option><option value="1">Lavender</option><option value="2">Sage</option><option value="3">Grape</option><option value="4">Flamingo</option><option value="5">Banana</option><option value="6">Tangerine</option><option value="7">Peacock</option><option value="8">Graphite</option><option value="9">Blueberry</option><option value="10">Basil</option><option value="11">Tomato</option></select></Field><Field label="Reminders"><select value={config.syncPolicy.reminderMode} onChange={e => setPolicy({ reminderMode: e.target.value as SyncPolicy["reminderMode"] })}><option value="calendar_default">Use calendar defaults</option><option value="none">No reminders</option><option value="custom">One custom reminder</option></select></Field>{config.syncPolicy.reminderMode === "custom" && <Field label="Custom reminder"><div className="inline-fields"><input type="number" min={0} max={40320} value={config.syncPolicy.reminderMinutes} onChange={e => setPolicy({ reminderMinutes: Number(e.target.value) })} /><select value={config.syncPolicy.reminderMethod} onChange={e => setPolicy({ reminderMethod: e.target.value as SyncPolicy["reminderMethod"] })}><option value="popup">Popup minutes before</option><option value="email">Email minutes before</option></select></div></Field>}</div>
+      </SettingsSection>}
+
+      {section === "Connections" && <SettingsSection title="Connected services" intro="Review or replace every connection value configured during setup. Stored secrets are never revealed.">
+        <div className="connection-settings-block"><div className="connection-settings-head"><span className="connection-logo">S</span><div><b>Schoolbox</b><small>{config.hasSchoolboxToken ? "JWT stored securely" : "Token required"}</small></div><button type="button" className="button secondary" onClick={() => void testConnection("schoolbox")} disabled={testing !== null}>{testing === "schoolbox" ? "Testing…" : "Test Schoolbox"}</button></div><div className="form-grid two"><Field label="Schoolbox base URL"><input type="url" value={config.schoolboxUrl} onChange={e => setConfig(c => ({ ...c, schoolboxUrl: e.target.value }))} placeholder="https://schoolbox.example.edu" /></Field><Field label="Replace superuser JWT" hint={config.hasSchoolboxToken ? "Leave blank to retain the encrypted token." : "Required before activation."}><input type="password" autoComplete="off" value={config.schoolboxJwt} onChange={e => setConfig(c => ({ ...c, schoolboxJwt: e.target.value }))} placeholder={config.hasSchoolboxToken ? "Stored securely" : "Paste Schoolbox JWT"} /></Field></div></div>
+        <div className="connection-settings-block"><div className="connection-settings-head"><span className="connection-logo google">G</span><div><b>Google Workspace</b><small>{config.serviceAccountEmail || (config.hasGoogleServiceAccount ? "Service account stored securely" : "Credentials required")}</small></div><button type="button" className="button secondary" onClick={() => void testConnection("google")} disabled={testing !== null}>{testing === "google" ? "Testing…" : "Test Google"}</button></div><div className="form-grid two"><Field label="Delegated administrator"><input type="email" value={config.adminEmail} onChange={e => setConfig(c => ({ ...c, adminEmail: e.target.value }))} placeholder="calendar-admin@example.edu" /></Field><Field label="Directory customer"><input value={config.googleCustomer} onChange={e => setConfig(c => ({ ...c, googleCustomer: e.target.value }))} placeholder="my_customer" /></Field></div><Field label="Replace service-account JSON" hint={config.hasGoogleServiceAccount ? `Leave blank to retain the encrypted credential${config.serviceAccountClientId ? ` (client ID ${config.serviceAccountClientId})` : ""}.` : "Paste the complete downloaded JSON key."}><textarea rows={7} value={config.serviceAccountJson} onChange={e => setConfig(c => ({ ...c, serviceAccountJson: e.target.value }))} placeholder={config.hasGoogleServiceAccount ? "Stored securely" : '{\n  "type": "service_account"\n}'} /></Field></div>
+        <Field label="Calendar time zone" hint="IANA time-zone name used for timed Google Calendar events."><input value={config.timezone} onChange={e => setConfig(c => ({ ...c, timezone: e.target.value }))} placeholder="Australia/Sydney" /></Field>
+        <div className="callout warm"><span>!</span><div><b>Test replacement credentials before saving</b><p>Changing the Schoolbox host requires a replacement JWT. Leaving either secret field blank preserves the existing encrypted credential.</p></div></div>
+      </SettingsSection>}
+
+      {section === "Reconciliation" && <SettingsSection title="Reconciliation and removal" intro="Decide what Relay does with events it previously created when the Schoolbox source or policy changes.">
+        <PolicyToggle checked={config.syncPolicy.deleteMissingEvents} onChange={enabled => setPolicy({ deleteMissingEvents: enabled })} title="Remove events no longer returned by Schoolbox" detail="Recommended for a true mirror. Removal is limited to Relay mapping records and the fetched date window." />
+        <PolicyToggle checked={config.syncPolicy.deleteExcludedEvents} onChange={enabled => setPolicy({ deleteExcludedEvents: enabled })} title="Remove events excluded by these settings" detail="When a category, exact type, time form, or completion state is turned off, remove its existing Relay-managed event on the next enabled-user sync." />
+        <div className="callout warm"><span>!</span><div><b>Policy removals are deliberate calendar changes</b><p>Save first, review the settings, then run a pilot user. Relay never targets manually-created or third-party Google events.</p></div></div>
+      </SettingsSection>}
+
+      {section === "Advanced" && <SettingsSection title="Advanced operations" intro="Control scheduler state and how much parallel work Relay sends to the APIs.">
+        <PolicyToggle checked={config.enabled} onChange={enabled => setConfig(c => ({ ...c, enabled }))} title="Scheduled synchronization enabled" detail={config.enabled ? "The local scheduler starts runs at the configured interval." : "Scheduled runs are paused; manual runs remain available to operators."} />
+        <Field label="Concurrent user calendars" hint="Lower this if either API begins throttling; range 1–10."><input type="number" min={1} max={10} value={config.concurrency} onChange={e => setConfig(c => ({ ...c, concurrency: e.target.value }))} /></Field>
+        <div className="callout"><span>✓</span><div><b>Built-in safeguards remain active</b><p>API retries use exponential backoff, requests are month-chunked, and only Relay-managed event IDs are updated or deleted.</p></div></div>
+      </SettingsSection>}
+
+      <div className="settings-actions"><span>Changes take effect on the next sync. Saving does not start a run.</span><button className="button primary" type="submit">Save all settings</button></div>
+    </form>
+  </div>;
+}
+
+function PolicyToggle({ checked, onChange, title, detail }: { checked: boolean; onChange: (checked: boolean) => void; title: string; detail: string }) {
+  return <label className="settings-toggle"><span><b>{title}</b><small>{detail}</small></span><input type="checkbox" checked={checked} onChange={event => onChange(event.target.checked)} /><i aria-hidden="true" /></label>;
 }
 
 function AccessPage({ canChangeLocalPassword, setNotice, onSignedOut }: { canChangeLocalPassword: boolean; setNotice: (notice: Notice) => void; onSignedOut: () => void }) {

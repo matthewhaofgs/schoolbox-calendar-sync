@@ -8,6 +8,7 @@ import {
   type GoogleDirectoryUser,
 } from "./google";
 import { SchoolboxClient, type NormalizedSchoolboxCalendarEvent, type SchoolboxUser } from "./schoolbox";
+import { eventIncludedByPolicy, type SyncPolicy } from "./policy";
 import {
   addAudit,
   createRun,
@@ -20,6 +21,7 @@ import {
   listRuns,
   recordManagedEventCleanup,
   recoverStaleRuns,
+  recordDiscoveredEventTypes,
   setUsersSyncEnabled,
   touchRunHeartbeat,
   touchEventMapping,
@@ -82,20 +84,26 @@ function isGoogleActive(user: GoogleDirectoryUser): boolean {
   return !record.suspended && !record.archived;
 }
 
-async function eventBody(
+export async function eventBody(
   event: NormalizedSchoolboxCalendarEvent,
   googleUserId: string,
   timezone: string,
   sourceKey: string,
+  policy: SyncPolicy,
 ): Promise<GoogleCalendarEventInput & { id: string }> {
   const id = await createDeterministicEventId(`${googleUserId}:${sourceKey}`);
   const sourceLink = event.sourceUrl;
-  const descriptionParts = [event.description, sourceLink ? `Schoolbox: ${sourceLink}` : undefined].filter(Boolean);
+  const descriptionParts = [
+    policy.includeDescription ? event.description : undefined,
+    policy.includeEventTypeInDescription && event.type ? `Schoolbox type: ${event.type}` : undefined,
+    policy.includeAuthorInDescription && event.author ? `Schoolbox author: ${event.author}` : undefined,
+    policy.includeSchoolboxLink && sourceLink ? `Schoolbox: ${sourceLink}` : undefined,
+  ].filter(Boolean);
   const body: GoogleCalendarEventInput & { id: string } = {
     id,
-    summary: event.title || "Schoolbox event",
+    summary: `${policy.titlePrefix ? `${policy.titlePrefix} ` : ""}${event.title || "Schoolbox event"}`,
     description: descriptionParts.join("\n\n") || undefined,
-    location: event.location || undefined,
+    location: policy.includeLocation ? event.location || undefined : undefined,
     start: event.allDay ? { date: event.start.slice(0, 10) } : { dateTime: event.start, timeZone: timezone },
     end: event.allDay ? { date: event.end.slice(0, 10) } : { dateTime: event.end, timeZone: timezone },
     extendedProperties: {
@@ -107,7 +115,17 @@ async function eventBody(
       },
     },
   };
-  if (sourceLink) body.source = { title: "Open in Schoolbox", url: sourceLink };
+  if (policy.includeSchoolboxLink && sourceLink) body.source = { title: "Open in Schoolbox", url: sourceLink };
+  if (policy.visibility !== "default") body.visibility = policy.visibility;
+  if (policy.transparency !== "opaque") body.transparency = policy.transparency;
+  if (policy.colorId) body.colorId = policy.colorId;
+  if (policy.reminderMode === "none") body.reminders = { useDefault: false };
+  if (policy.reminderMode === "custom") {
+    body.reminders = {
+      useDefault: false,
+      overrides: [{ method: policy.reminderMethod, minutes: policy.reminderMinutes }],
+    };
+  }
   return body;
 }
 
@@ -128,7 +146,7 @@ async function syncUser(
   run: RunSummary,
   schoolbox: SchoolboxSyncClient,
   google: GoogleSyncClient,
-  options: { pastDays: number; futureDays: number; timezone: string },
+  options: { pastDays: number; futureDays: number; timezone: string; syncPolicy: SyncPolicy },
 ): Promise<void> {
   const now = new Date();
   const windowStart = new Date(now.getTime() - options.pastDays * 86_400_000);
@@ -156,12 +174,25 @@ async function syncUser(
     ]);
     const existing = new Map(storedMappings.map((mapping) => [mapping.sourceKey, mapping]));
     const seen = new Set<string>();
+    const excluded = new Set<string>();
+    const excludedSourceRoots = new Set<string>();
+    await recordDiscoveredEventTypes(events);
 
     for (const event of events) {
       const sourceKey = `${event.sourceKey}:occurrence:${event.start}`;
-      if (seen.has(sourceKey)) continue;
+      if (seen.has(sourceKey) || excluded.has(sourceKey)) continue;
+      if (!eventIncludedByPolicy({
+        category: event.category ?? "other",
+        type: event.type,
+        allDay: event.allDay,
+        completed: Boolean(event.completed),
+      }, options.syncPolicy)) {
+        excluded.add(sourceKey);
+        excludedSourceRoots.add(event.sourceKey);
+        continue;
+      }
       seen.add(sourceKey);
-      const body = await eventBody(event, googleUserId, options.timezone, sourceKey);
+      const body = await eventBody(event, googleUserId, options.timezone, sourceKey, options.syncPolicy);
       const hash = await createContentHash(body);
       const mapping = existing.get(sourceKey);
 
@@ -214,6 +245,10 @@ async function syncUser(
 
     for (const mapping of storedMappings) {
       if (seen.has(mapping.sourceKey)) continue;
+      const occurrenceMarker = mapping.sourceKey.lastIndexOf(":occurrence:");
+      const mappingRoot = occurrenceMarker >= 0 ? mapping.sourceKey.slice(0, occurrenceMarker) : mapping.sourceKey;
+      const excludedByPolicy = excluded.has(mapping.sourceKey) || excludedSourceRoots.has(mappingRoot);
+      if (excludedByPolicy ? !options.syncPolicy.deleteExcludedEvents : !options.syncPolicy.deleteMissingEvents) continue;
       const sourceStart = new Date(mapping.sourceStart);
       const sourceEnd = new Date(mapping.sourceEnd);
       const wasInsideFetchedWindow = sourceStart < windowEnd && sourceEnd > windowStart;
@@ -231,12 +266,13 @@ async function syncUser(
       run.eventsDeleted += 1;
     }
 
+    const managedEventCount = (await getEventMappings(googleUserId)).length;
     await upsertUserMapping({
       ...baseMapping,
       status: "synced",
       lastSyncAt: new Date().toISOString(),
       lastError: null,
-      eventCount: events.length,
+      eventCount: managedEventCount,
     });
     run.usersSynced += 1;
   } catch (error) {
@@ -415,6 +451,7 @@ export async function runFullSync(
         pastDays: config.pastDays,
         futureDays: config.futureDays,
         timezone: config.timezone,
+        syncPolicy: config.syncPolicy,
       }),
     );
     run.status = run.errors > 0 ? "completed_with_errors" : "completed";

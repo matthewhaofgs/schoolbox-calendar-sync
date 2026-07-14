@@ -35,6 +35,10 @@ function discovery(googleUserId, googleEmail, overrides = {}) {
 test("fresh installations leave newly discovered users paused by default", async () => {
   const config = await storage.getConfig();
   assert.equal(config.syncNewUsersByDefault, false);
+  assert.equal(config.syncPolicy.eventTypeMode, "all");
+  assert.ok(Object.values(config.syncPolicy.categories).every(Boolean));
+  assert.equal(config.syncPolicy.deleteMissingEvents, true);
+  assert.equal(config.syncPolicy.deleteExcludedEvents, true);
 
   await storage.discoverUserMappings(
     [discovery("google-1", "pilot.one@example.edu")],
@@ -44,6 +48,13 @@ test("fresh installations leave newly discovered users paused by default", async
   const [mapping] = await storage.listUserMappings();
   assert.equal(mapping.googleUserId, "google-1");
   assert.equal(mapping.syncEnabled, false);
+});
+
+test("configuration rejects an invalid calendar time zone", async () => {
+  await assert.rejects(
+    storage.saveConfig({ timezone: "Not/A_Real_Zone" }, "local:administrator"),
+    /valid IANA calendar time zone/i,
+  );
 });
 
 test("the discovery default is applied only on insert", async () => {

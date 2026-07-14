@@ -1,4 +1,14 @@
 import { db } from "./db";
+import {
+  DEFAULT_SYNC_POLICY,
+  EVENT_CATEGORIES,
+  eventTypeKey,
+  normalizeEventTypeLabel,
+  normalizeSyncPolicy,
+  type EventCategory,
+  type SyncPolicy,
+  type SyncPolicyInput,
+} from "./policy";
 import { decryptSecret, encryptSecret, HttpError } from "./security";
 
 export type AppConfig = {
@@ -13,6 +23,7 @@ export type AppConfig = {
   concurrency: number;
   syncIntervalMinutes: number;
   syncNewUsersByDefault: boolean;
+  syncPolicy: SyncPolicy;
   enabled: boolean;
   setupCompleted: boolean;
   hasSchoolboxToken: boolean;
@@ -22,7 +33,16 @@ export type AppConfig = {
   updatedAt?: string;
 };
 
-export type ConfigInput = Partial<Omit<AppConfig, "hasSchoolboxToken" | "hasGoogleServiceAccount" | "serviceAccountEmail" | "serviceAccountClientId">>;
+export type ConfigInput = Partial<Omit<AppConfig, "hasSchoolboxToken" | "hasGoogleServiceAccount" | "serviceAccountEmail" | "serviceAccountClientId" | "syncPolicy">> & {
+  syncPolicy?: SyncPolicyInput;
+};
+
+export type DiscoveredEventType = {
+  key: string;
+  label: string;
+  category: EventCategory;
+  lastSeenAt: string;
+};
 
 export type RunSummary = {
   id: string;
@@ -83,6 +103,7 @@ const schemaStatements = [
     concurrency INTEGER NOT NULL DEFAULT 3,
     sync_interval_minutes INTEGER NOT NULL DEFAULT 360,
     sync_new_users_by_default INTEGER NOT NULL DEFAULT 0 CHECK (sync_new_users_by_default IN (0, 1)),
+    sync_policy_json TEXT NOT NULL DEFAULT '{}',
     enabled INTEGER NOT NULL DEFAULT 0,
     setup_completed INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
@@ -131,6 +152,12 @@ const schemaStatements = [
     updated_at TEXT NOT NULL,
     PRIMARY KEY (google_user_id, source_key)
   )`,
+  `CREATE TABLE IF NOT EXISTS event_type_catalog (
+    type_key TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    category TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     occurred_at TEXT NOT NULL,
@@ -159,6 +186,11 @@ export async function ensureSchema(): Promise<void> {
     // Legacy installations implicitly synced every newly discovered account. Keep
     // that behaviour on upgrade; brand-new databases use the safer CREATE default.
     binding.prepare("ALTER TABLE app_config ADD COLUMN sync_new_users_by_default INTEGER NOT NULL DEFAULT 1 CHECK (sync_new_users_by_default IN (0, 1))").run();
+  }
+  if (!configColumns.some((column) => column.name === "sync_policy_json")) {
+    // Existing installations synchronized every category and copied all content.
+    // The policy defaults preserve that behaviour until an administrator changes it.
+    binding.prepare("ALTER TABLE app_config ADD COLUMN sync_policy_json TEXT NOT NULL DEFAULT '{}'").run();
   }
   let userColumns = binding.prepare("PRAGMA table_info(user_mappings)").all<{ name: string }>().results;
   const emailHasGlobalUniqueIndex = binding.prepare("PRAGMA index_list(user_mappings)")
@@ -226,6 +258,7 @@ type ConfigRow = {
   concurrency: number;
   sync_interval_minutes: number;
   sync_new_users_by_default: number;
+  sync_policy_json: string;
   enabled: number;
   setup_completed: number;
   updated_at: string;
@@ -260,6 +293,10 @@ export async function getConfig(includeSecrets = false): Promise<AppConfig> {
     concurrency: row.concurrency,
     syncIntervalMinutes: row.sync_interval_minutes,
     syncNewUsersByDefault: Boolean(row.sync_new_users_by_default),
+    syncPolicy: (() => {
+      try { return normalizeSyncPolicy(JSON.parse(row.sync_policy_json || "{}"), DEFAULT_SYNC_POLICY); }
+      catch { return normalizeSyncPolicy({}, DEFAULT_SYNC_POLICY); }
+    })(),
     enabled: Boolean(row.enabled),
     setupCompleted: Boolean(row.setup_completed),
     hasSchoolboxToken: Boolean(row.schoolbox_token_encrypted),
@@ -317,6 +354,9 @@ export async function saveConfig(input: ConfigInput, actor: string): Promise<App
   const adminEmail = (input.googleAdminEmail ?? current.googleAdminEmail).trim().toLowerCase();
   const customer = (input.googleCustomer ?? current.googleCustomer ?? "my_customer").trim();
   const timezone = (input.timezone ?? current.timezone).trim() || "Australia/Sydney";
+  try { new Intl.DateTimeFormat("en-AU", { timeZone: timezone }).format(new Date()); }
+  catch { throw new HttpError(400, "Enter a valid IANA calendar time zone"); }
+  const syncPolicy = normalizeSyncPolicy(input.syncPolicy ?? {}, current.syncPolicy);
   const tokenEncrypted = input.schoolboxToken
     ? await encryptSecret(input.schoolboxToken.trim())
     : null;
@@ -360,6 +400,7 @@ export async function saveConfig(input: ConfigInput, actor: string): Promise<App
       concurrency = ?,
       sync_interval_minutes = ?,
       sync_new_users_by_default = ?,
+      sync_policy_json = ?,
       enabled = ?,
       setup_completed = ?,
       updated_at = ?
@@ -376,6 +417,7 @@ export async function saveConfig(input: ConfigInput, actor: string): Promise<App
       clampInteger(input.concurrency, current.concurrency, 1, 10),
       clampInteger(input.syncIntervalMinutes, current.syncIntervalMinutes, 15, 1440),
       input.syncNewUsersByDefault === undefined ? Number(current.syncNewUsersByDefault) : Number(input.syncNewUsersByDefault),
+      JSON.stringify(syncPolicy),
       input.enabled === undefined ? Number(current.enabled) : Number(input.enabled),
       input.setupCompleted === undefined ? Number(current.setupCompleted) : Number(input.setupCompleted),
       now,
@@ -384,6 +426,34 @@ export async function saveConfig(input: ConfigInput, actor: string): Promise<App
 
   await addAudit(actor, "configuration.updated", "Connection or sync settings were updated");
   return getConfig(false);
+}
+
+export async function recordDiscoveredEventTypes(events: Array<{ type: string | null; category: EventCategory }>): Promise<void> {
+  await ensureSchema();
+  const now = new Date().toISOString();
+  const discovered = new Map<string, { label: string; category: EventCategory }>();
+  for (const event of events) {
+    const label = normalizeEventTypeLabel(event.type);
+    const key = eventTypeKey(label);
+    if (!key || !EVENT_CATEGORIES.includes(event.category)) continue;
+    discovered.set(key, { label, category: event.category });
+  }
+  if (discovered.size === 0) return;
+  db().transaction(() => {
+    const statement = db().prepare(`INSERT INTO event_type_catalog (type_key, label, category, last_seen_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(type_key) DO UPDATE SET
+        label = excluded.label,
+        category = CASE WHEN event_type_catalog.category = excluded.category THEN excluded.category ELSE 'other' END,
+        last_seen_at = excluded.last_seen_at`);
+    for (const [key, event] of discovered) statement.bind(key, event.label, event.category, now).run();
+  });
+}
+
+export async function listDiscoveredEventTypes(): Promise<DiscoveredEventType[]> {
+  await ensureSchema();
+  return db().prepare(`SELECT type_key AS key, label, category, last_seen_at AS lastSeenAt
+    FROM event_type_catalog ORDER BY label COLLATE NOCASE`).all<DiscoveredEventType>().results;
 }
 
 export async function addAudit(actor: string, action: string, detail?: string): Promise<void> {

@@ -1,6 +1,6 @@
 # Relay
 
-Relay is a self-hosted, one-way calendar bridge from Schoolbox to Google Workspace. It discovers users by primary email, reads each Schoolbox user's complete calendar feed, and reconciles Relay-owned events into that user's primary Google Calendar.
+Relay is a self-hosted, one-way calendar bridge from Schoolbox to Google Workspace. It discovers users by primary email, reads each enabled user's Schoolbox calendar feed, applies an administrator-defined event policy, and reconciles Relay-owned events into that user's primary Google Calendar.
 
 Relay includes timetable lessons, resource bookings, school events, and individual events. Google calendar access uses a service account with Domain-Wide Delegation, so users do not install an app or complete individual consent.
 
@@ -154,6 +154,21 @@ The Web OAuth client used for IT login and the service account used for calendar
 
 After both connections and credentials are saved, **Setup** changes to a completed connection summary. Reopen the wizard only when replacing credentials or delegation; routine sync changes remain under **Settings**.
 
+## Granular sync settings
+
+New and upgraded installations initially include every event category and preserve the original mirror behaviour. Saving settings never starts a sync; test the resulting policy with one enabled pilot user before wider rollout.
+
+- **Schedule** controls intervals from 15 minutes to daily and a rolling calendar window from today through two years ahead. Relay automatically divides Schoolbox calendar requests into the API's recommended month-sized ranges.
+- **People** controls whether future Google/Schoolbox matches begin enabled or paused.
+- **Event types** independently controls timetable lessons, resource bookings, school events, individual events, other/custom sources, all-day events, timed events, and completed items.
+- Exact Schoolbox type rules can include only listed labels or exclude listed labels. Type labels observed during normal enabled-user syncs appear as selectable suggestions; Relay does not scan paused users merely to build the catalogue.
+- **Calendar content** controls descriptions, locations, Schoolbox source links, type and author annotations, title prefixes, Google visibility, busy/free state, colour, and reminders.
+- **Connections** exposes the saved Schoolbox URL, delegated Google administrator, Directory customer, time zone, service-account identity, encrypted-secret replacement fields, and both connection tests.
+- **Reconciliation** separately controls removal when an event disappears from Schoolbox and removal when the current event policy excludes it. Both operations use Relay's managed-event mappings and never select unrelated Google events.
+- **Advanced** can pause scheduled runs and tune concurrent per-user calendar work from one to ten. Manual runs remain available while the scheduler is paused.
+
+Schoolbox type labels are installation-defined metadata. Relay combines broad source classification with exact, case-insensitive label rules; unrecognised sources fall under **Other and custom** so they are not silently lost by default.
+
 ## Pilot and user coverage
 
 Relay discovers every active Google Workspace identity on each run, records its Schoolbox email match, and syncs only users whose **Calendar sync** control is enabled.
@@ -273,6 +288,8 @@ Interrupted syncs without a heartbeat for five minutes are marked failed automat
 - [Schoolbox API](https://api.schoolbox.com.au/)
 - [Google Workspace Domain-Wide Delegation](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority)
 - [Google Calendar authorization scopes](https://developers.google.com/workspace/calendar/api/auth)
+- [Google Calendar event resource](https://developers.google.com/workspace/calendar/api/v3/reference/events)
+- [Google Calendar reminders](https://developers.google.com/workspace/calendar/api/concepts/reminders)
 - [Google Directory users.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/users/list)
 - [Google OpenID Connect](https://developers.google.com/identity/openid-connect/openid-connect)
 - [Google OAuth web server applications](https://developers.google.com/identity/protocols/oauth2/web-server)

@@ -124,6 +124,11 @@ export interface NormalizedSchoolboxCalendarEvent {
   description: string;
   location: string | null;
   type: string | null;
+  typeCode: string | null;
+  typeId: number | null;
+  category: EventCategory;
+  completed: boolean;
+  author: string | null;
   sourceUrl: string | null;
   /** A YYYY-MM-DD value for all-day events, otherwise a date-time string. */
   start: string;
@@ -132,6 +137,21 @@ export interface NormalizedSchoolboxCalendarEvent {
   allDay: boolean;
   editable: boolean;
   raw: RawSchoolboxCalendarEvent;
+}
+
+function classifyEventCategory(raw: RawSchoolboxCalendarEvent): EventCategory {
+  const meta = raw.data?.meta;
+  const classification = [meta?.type, meta?.eventType, meta?.variant, meta?.level, raw.className]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .toLocaleLowerCase("en-AU");
+  if (/\b(resource|booking)\b/.test(classification)) {
+    return "resource_booking";
+  }
+  if (raw.data?.classAttendance?.url || /\b(timetable|lesson|class)\b/.test(classification)) return "timetable";
+  if (/\b(individual|personal)\b/.test(classification)) return "individual_event";
+  if (/\bschool[ _-]?event\b/.test(classification)) return "school_event";
+  return "other";
 }
 
 /** Concise alias for consumers that deal only with normalized events. */
@@ -469,6 +489,10 @@ export function normalizeSchoolboxCalendarEvent(
     asNonEmptyString(meta?.variant) ??
     asNonEmptyString(raw.className) ??
     null;
+  const typeCode = asNonEmptyString(meta?.eventType) ?? null;
+  const typeId = typeof meta?.eventTypeId === "number" && Number.isFinite(meta.eventTypeId)
+    ? meta.eventTypeId
+    : null;
   const sourceUrl = makeAbsoluteUrl(
     baseUrl,
     raw.data?.links?.path ?? raw.data?.classAttendance?.url,
@@ -510,6 +534,11 @@ export function normalizeSchoolboxCalendarEvent(
     description,
     location,
     type: eventType,
+    typeCode,
+    typeId,
+    category: classifyEventCategory(raw),
+    completed: Boolean(meta?.completed),
+    author: asNonEmptyString(meta?.author) ?? null,
     sourceUrl,
     start,
     end,
@@ -1055,3 +1084,4 @@ export class SchoolboxClient {
     });
   }
 }
+import type { EventCategory } from "./policy";

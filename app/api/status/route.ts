@@ -20,6 +20,7 @@ export async function GET(request: Request) {
         pastDays: snapshot.config.pastDays,
         futureDays: snapshot.config.futureDays,
         timezone: snapshot.config.timezone,
+        syncPolicy: snapshot.config.syncPolicy,
       },
     });
   } catch (error) {

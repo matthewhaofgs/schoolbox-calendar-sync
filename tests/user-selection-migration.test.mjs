@@ -79,6 +79,11 @@ test("upgrades preserve sync-all behavior for existing installations and mapping
   const [mapping] = await storage.listUserMappings();
 
   assert.equal(config.syncNewUsersByDefault, true);
+  assert.equal(config.syncPolicy.eventTypeMode, "all");
+  assert.ok(Object.values(config.syncPolicy.categories).every(Boolean));
+  assert.equal(config.syncPolicy.includeDescription, true);
+  assert.equal(config.syncPolicy.includeLocation, true);
+  assert.equal(config.syncPolicy.includeSchoolboxLink, true);
   assert.equal(mapping.googleUserId, "existing-user");
   assert.equal(mapping.syncEnabled, true);
   assert.equal(mapping.directoryActive, true);
