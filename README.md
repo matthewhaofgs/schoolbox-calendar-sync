@@ -6,6 +6,36 @@ Relay includes timetable lessons, resource bookings, school events, and individu
 
 Relay is an independent project and is not affiliated with or endorsed by Schoolbox or Google. This public repository contains source code and safe examples only; never commit a live environment file, credential, database, backup, or exported calendar data.
 
+## Screenshots
+
+Every screenshot below was captured from an isolated local database containing fictional `example.edu` sample data. Select an image to view it at full resolution.
+
+### Overview
+
+[![Relay calendar operations overview](docs/screenshots/overview.png)](docs/screenshots/overview.png)
+
+### Administration workflow
+
+| Sign in | Setup complete |
+| --- | --- |
+| [![Relay administrator sign-in](docs/screenshots/login.png)](docs/screenshots/login.png) | [![Relay setup completion summary](docs/screenshots/setup-complete.png)](docs/screenshots/setup-complete.png) |
+| **People and sync coverage** | **Runs and troubleshooting** |
+| [![Relay people and sync coverage](docs/screenshots/people.png)](docs/screenshots/people.png) | [![Relay run history and diagnostic detail](docs/screenshots/runs.png)](docs/screenshots/runs.png) |
+| **IT access** | |
+| [![Relay Google sign-in and IT staff access](docs/screenshots/it-access.png)](docs/screenshots/it-access.png) | |
+
+### Sync settings
+
+| Schedule | New-user coverage |
+| --- | --- |
+| [![Relay sync schedule settings](docs/screenshots/settings-schedule.png)](docs/screenshots/settings-schedule.png) | [![Relay new-user coverage settings](docs/screenshots/settings-people.png)](docs/screenshots/settings-people.png) |
+| **Event rules and calendar routing** | **Event content** |
+| [![Relay event rules and per-type calendar routing](docs/screenshots/settings-event-rules.png)](docs/screenshots/settings-event-rules.png) | [![Relay event content settings](docs/screenshots/settings-event-content.png)](docs/screenshots/settings-event-content.png) |
+| **Connections** | **Reconciliation** |
+| [![Relay connected service settings](docs/screenshots/settings-connections.png)](docs/screenshots/settings-connections.png) | [![Relay reconciliation and removal settings](docs/screenshots/settings-reconciliation.png)](docs/screenshots/settings-reconciliation.png) |
+| **Advanced operations** | |
+| [![Relay advanced operation settings](docs/screenshots/settings-advanced.png)](docs/screenshots/settings-advanced.png) | |
+
 ## Deployment model
 
 Relay is designed for one internal server and one running application replica:
@@ -298,3 +328,7 @@ Interrupted syncs without a heartbeat for five minutes are marked failed automat
 - [Google OpenID Connect](https://developers.google.com/identity/openid-connect/openid-connect)
 - [Google OAuth web server applications](https://developers.google.com/identity/protocols/oauth2/web-server)
 - [Next.js self-hosting](https://nextjs.org/docs/app/guides/self-hosting)
+
+## License
+
+Relay is available under the [MIT License](LICENSE).
