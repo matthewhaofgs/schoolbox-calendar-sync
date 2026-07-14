@@ -16,6 +16,8 @@ export const GOOGLE_DIRECTORY_USER_READONLY_SCOPE =
   "https://www.googleapis.com/auth/admin.directory.user.readonly";
 export const GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE =
   "https://www.googleapis.com/auth/calendar.events.owned";
+export const GOOGLE_CALENDAR_APP_CREATED_SCOPE =
+  "https://www.googleapis.com/auth/calendar.app.created";
 export const GOOGLE_WORKSPACE_SCOPES = [
   GOOGLE_DIRECTORY_USER_READONLY_SCOPE,
   GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE,
@@ -168,6 +170,29 @@ export interface GoogleCalendarEventsPage {
   items?: GoogleCalendarEvent[];
 }
 
+export interface GoogleCalendarResource {
+  kind?: string;
+  etag?: string;
+  id?: string;
+  summary?: string;
+  description?: string;
+  location?: string;
+  timeZone?: string;
+  [key: string]: unknown;
+}
+
+export interface GoogleCalendarInput {
+  summary: string;
+  description?: string;
+  location?: string;
+  timeZone?: string;
+}
+
+export interface GoogleCalendarManagementOptions {
+  quotaUser?: string;
+  signal?: AbortSignal;
+}
+
 export type GoogleCalendarSendUpdates = "all" | "externalOnly" | "none";
 
 export interface GoogleCalendarMutationOptions {
@@ -219,6 +244,7 @@ export interface GoogleConnectionTestResult {
     ok: true;
     targetUserEmail: string;
     readableEvents: number;
+    secondaryCalendarManagement: true;
   };
 }
 
@@ -1002,6 +1028,52 @@ export class GoogleWorkspaceClient {
     return url;
   }
 
+  /** Creates a secondary calendar owned by the delegated Workspace user. */
+  async createCalendar(
+    userEmail: string,
+    calendar: GoogleCalendarInput,
+    options: GoogleCalendarManagementOptions = {},
+  ): Promise<GoogleCalendarResource> {
+    if (!calendar.summary.trim()) throw new TypeError("A secondary calendar name is required.");
+    const url = new URL(`${GOOGLE_CALENDAR_API_BASE_URL}/calendars`);
+    url.searchParams.set("quotaUser", await this.quotaUser(userEmail, options.quotaUser));
+    return this.authorizedRequest<GoogleCalendarResource>(
+      userEmail,
+      [GOOGLE_CALENDAR_APP_CREATED_SCOPE],
+      url,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(calendar),
+        signal: options.signal,
+      },
+    );
+  }
+
+  /** Keeps a Relay-managed secondary calendar's administrator-defined properties current. */
+  async updateCalendar(
+    userEmail: string,
+    calendarId: string,
+    calendar: GoogleCalendarInput,
+    options: GoogleCalendarManagementOptions = {},
+  ): Promise<GoogleCalendarResource> {
+    if (!calendarId.trim()) throw new TypeError("calendarId is required.");
+    if (!calendar.summary.trim()) throw new TypeError("A secondary calendar name is required.");
+    const url = new URL(`${GOOGLE_CALENDAR_API_BASE_URL}/calendars/${encodeURIComponent(calendarId)}`);
+    url.searchParams.set("quotaUser", await this.quotaUser(userEmail, options.quotaUser));
+    return this.authorizedRequest<GoogleCalendarResource>(
+      userEmail,
+      [GOOGLE_CALENDAR_APP_CREATED_SCOPE],
+      url,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(calendar),
+        signal: options.signal,
+      },
+    );
+  }
+
   async listCalendarEvents(
     userEmail: string,
     options: ListGoogleCalendarEventsOptions = {},
@@ -1157,6 +1229,9 @@ export class GoogleWorkspaceClient {
       showDeleted: false,
       signal: options.signal,
     });
+    // Token issuance validates the delegated app-created scope without creating
+    // or changing a user's calendar during a diagnostic.
+    await this.getAccessToken(calendarUser, [GOOGLE_CALENDAR_APP_CREATED_SCOPE]);
 
     return {
       ok: true,
@@ -1171,6 +1246,7 @@ export class GoogleWorkspaceClient {
         ok: true,
         targetUserEmail: normalizeSubject(calendarUser),
         readableEvents: calendar.items?.length ?? 0,
+        secondaryCalendarManagement: true,
       },
     };
   }

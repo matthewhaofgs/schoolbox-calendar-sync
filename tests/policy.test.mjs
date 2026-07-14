@@ -5,6 +5,7 @@ import {
   DEFAULT_SYNC_POLICY,
   eventIncludedByPolicy,
   normalizeSyncPolicy,
+  resolveGoogleEventRule,
 } from "../lib/policy.ts";
 import { normalizeSchoolboxCalendarEvent } from "../lib/schoolbox.ts";
 import { eventBody } from "../lib/sync.ts";
@@ -97,4 +98,35 @@ test("Google event rendering respects content, privacy, colour and reminder sett
   assert.equal(defaults.transparency, undefined);
   assert.equal(defaults.colorId, undefined);
   assert.equal(defaults.reminders, undefined);
+});
+
+test("exact Google rules override category rules and reusable destinations safely", async () => {
+  const policy = normalizeSyncPolicy({
+    defaultDestinationId: "primary",
+    secondaryCalendars: [
+      { id: "learning", name: "Learning", description: "Course calendar" },
+      { id: "duplicate", name: " learning ", description: "Ignored duplicate" },
+    ],
+    transparency: "opaque",
+    colorId: "",
+    categoryOverrides: {
+      timetable: { destinationId: "learning", transparency: "transparent", colorId: "2" },
+    },
+    eventTypeOverrides: {
+      " Special Lesson ": { transparency: "opaque", colorId: "9", visibility: "private", enabled: true },
+    },
+  });
+
+  assert.deepEqual(policy.secondaryCalendars.map(calendar => calendar.id), ["learning"]);
+  const categoryRule = resolveGoogleEventRule({ category: "timetable", type: "Ordinary lesson" }, policy);
+  assert.equal(categoryRule.destinationId, "learning");
+  assert.equal(categoryRule.transparency, "transparent");
+  assert.equal(categoryRule.colorId, "2");
+
+  const exactRule = resolveGoogleEventRule({ category: "timetable", type: "special lesson" }, policy);
+  assert.equal(exactRule.destinationId, "learning", "unoverridden fields continue to inherit from category");
+  assert.equal(exactRule.transparency, "opaque");
+  assert.equal(exactRule.colorId, "9");
+  assert.equal(exactRule.visibility, "private");
+  assert.equal(eventIncludedByPolicy({ category: "timetable", type: "SPECIAL LESSON", allDay: false, completed: false }, policy), true);
 });

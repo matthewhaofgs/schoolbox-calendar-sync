@@ -1,6 +1,6 @@
 # Relay
 
-Relay is a self-hosted, one-way calendar bridge from Schoolbox to Google Workspace. It discovers users by primary email, reads each enabled user's Schoolbox calendar feed, applies an administrator-defined event policy, and reconciles Relay-owned events into that user's primary Google Calendar.
+Relay is a self-hosted, one-way calendar bridge from Schoolbox to Google Workspace. It discovers users by primary email, reads each enabled user's Schoolbox calendar feed, applies an administrator-defined event policy, and reconciles Relay-owned events into configured primary or app-managed secondary Google calendars.
 
 Relay includes timetable lessons, resource bookings, school events, and individual events. Google calendar access uses a service account with Domain-Wide Delegation, so users do not install an app or complete individual consent.
 
@@ -143,7 +143,7 @@ The `hd` login hint is not trusted by itself. Relay verifies the signed Google I
 7. Add the service account's numeric Client ID with exactly these scopes:
 
 ```text
-https://www.googleapis.com/auth/admin.directory.user.readonly,https://www.googleapis.com/auth/calendar.events.owned
+https://www.googleapis.com/auth/calendar.events.owned,https://www.googleapis.com/auth/calendar.app.created,https://www.googleapis.com/auth/admin.directory.user.readonly
 ```
 
 8. Paste the service-account JSON and delegated administrator email into Relay, then run the Directory and Calendar tests.
@@ -160,14 +160,18 @@ New and upgraded installations initially include every event category and preser
 
 - **Schedule** controls intervals from 15 minutes to daily and a rolling calendar window from today through two years ahead. Relay automatically divides Schoolbox calendar requests into the API's recommended month-sized ranges.
 - **People** controls whether future Google/Schoolbox matches begin enabled or paused.
+- **Google routing** defines the global destination and reusable secondary-calendar names, plus fallback visibility, busy/free state, colour, and reminders. It also supports category-level Google overrides.
 - **Event types** independently controls timetable lessons, resource bookings, school events, individual events, other/custom sources, all-day events, timed events, and completed items.
-- Exact Schoolbox type rules can include only listed labels or exclude listed labels. Type labels observed during normal enabled-user syncs appear as selectable suggestions; Relay does not scan paused users merely to build the catalogue.
-- **Calendar content** controls descriptions, locations, Schoolbox source links, type and author annotations, title prefixes, Google visibility, busy/free state, colour, and reminders.
+- Exact Schoolbox type rules can override source inclusion, destination calendar, visibility, busy/free state, one of Google's event colours, and reminder behaviour. Type rules take priority over category rules, which take priority over the global fallback.
+- Type labels observed during normal enabled-user syncs become expandable rule editors; Relay does not scan paused users merely to build the catalogue.
+- **Event content** controls descriptions, locations, Schoolbox source links, type and author annotations, and title prefixes.
 - **Connections** exposes the saved Schoolbox URL, delegated Google administrator, Directory customer, time zone, service-account identity, encrypted-secret replacement fields, and both connection tests.
 - **Reconciliation** separately controls removal when an event disappears from Schoolbox and removal when the current event policy excludes it. Both operations use Relay's managed-event mappings and never select unrelated Google events.
 - **Advanced** can pause scheduled runs and tune concurrent per-user calendar work from one to ten. Manual runs remain available while the scheduler is paused.
 
 Schoolbox type labels are installation-defined metadata. Relay combines broad source classification with exact, case-insensitive label rules; unrecognised sources fall under **Other and custom** so they are not silently lost by default.
+
+Secondary calendars are created lazily for each enabled user only when an included event first targets that destination. Relay stores the returned Google calendar ID per user. Changing a type's destination writes the managed event to its new calendar before deleting the old copy; removing a destination from Relay settings does not delete the Google calendar itself. Existing and upgraded policies continue to target the primary calendar until an administrator deliberately changes a rule.
 
 ## Pilot and user coverage
 
@@ -183,7 +187,7 @@ Relay discovers every active Google Workspace identity on each run, records its 
 
 ## Persistence, secrets, and backups
 
-The database contains configuration, encrypted credentials, staff access, session hashes, user/event mappings, audit entries, and sync history. Secret fields are AES-256-GCM encrypted with `CONFIG_ENCRYPTION_KEY`.
+The database contains configuration, encrypted credentials, staff access, session hashes, user/event/calendar-target mappings, audit entries, and sync history. Secret fields are AES-256-GCM encrypted with `CONFIG_ENCRYPTION_KEY`.
 
 For Docker, persistent data is in the `relay-calendar-data` volume. Back up the database volume and `.env.production` together. They form one recovery set: restoring the database without its matching encryption key can make saved credentials unrecoverable.
 

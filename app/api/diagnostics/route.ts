@@ -61,7 +61,7 @@ export async function POST(request: Request) {
       return Response.json({
         ok: true,
         target: "google",
-        message: `Google Workspace verified for ${result.directory.adminSubject}; Calendar impersonation also succeeded.`,
+        message: `Google Workspace verified for ${result.directory.adminSubject}; event access and app-created calendar delegation both succeeded.`,
         result,
       });
     }

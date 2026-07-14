@@ -84,10 +84,12 @@ test("upgrades preserve sync-all behavior for existing installations and mapping
   assert.equal(config.syncPolicy.includeDescription, true);
   assert.equal(config.syncPolicy.includeLocation, true);
   assert.equal(config.syncPolicy.includeSchoolboxLink, true);
+  assert.equal(config.syncPolicy.defaultDestinationId, "primary");
   assert.equal(mapping.googleUserId, "existing-user");
   assert.equal(mapping.syncEnabled, true);
   assert.equal(mapping.directoryActive, true);
   assert.equal((await storage.getEventMappings("existing-user"))[0]?.googleEventId, "legacy-event");
+  assert.equal((await storage.getEventMappings("existing-user"))[0]?.calendarId, "primary");
 });
 
 test("legacy global email uniqueness is replaced by active-directory uniqueness", async () => {

@@ -81,10 +81,22 @@ export type EventMapping = {
   googleUserId: string;
   sourceKey: string;
   googleEventId: string;
+  calendarId: string;
   sourceHash: string;
   sourceStart: string;
   sourceEnd: string;
   lastSeenRunId: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type UserCalendarTarget = {
+  googleUserId: string;
+  destinationId: string;
+  googleCalendarId: string;
+  summary: string;
+  description: string;
+  timeZone: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -144,6 +156,7 @@ const schemaStatements = [
     google_user_id TEXT NOT NULL,
     source_key TEXT NOT NULL,
     google_event_id TEXT NOT NULL,
+    calendar_id TEXT NOT NULL DEFAULT 'primary',
     source_hash TEXT NOT NULL,
     source_start TEXT NOT NULL,
     source_end TEXT NOT NULL,
@@ -151,6 +164,17 @@ const schemaStatements = [
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (google_user_id, source_key)
+  )`,
+  `CREATE TABLE IF NOT EXISTS user_calendar_targets (
+    google_user_id TEXT NOT NULL,
+    destination_id TEXT NOT NULL,
+    google_calendar_id TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    time_zone TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (google_user_id, destination_id)
   )`,
   `CREATE TABLE IF NOT EXISTS event_type_catalog (
     type_key TEXT PRIMARY KEY,
@@ -191,6 +215,11 @@ export async function ensureSchema(): Promise<void> {
     // Existing installations synchronized every category and copied all content.
     // The policy defaults preserve that behaviour until an administrator changes it.
     binding.prepare("ALTER TABLE app_config ADD COLUMN sync_policy_json TEXT NOT NULL DEFAULT '{}'").run();
+  }
+  const eventMappingColumns = binding.prepare("PRAGMA table_info(event_mappings)").all<{ name: string }>().results;
+  if (!eventMappingColumns.some((column) => column.name === "calendar_id")) {
+    // Every event created by older Relay versions was placed on the primary calendar.
+    binding.prepare("ALTER TABLE event_mappings ADD COLUMN calendar_id TEXT NOT NULL DEFAULT 'primary'").run();
   }
   let userColumns = binding.prepare("PRAGMA table_info(user_mappings)").all<{ name: string }>().results;
   const emailHasGlobalUniqueIndex = binding.prepare("PRAGMA index_list(user_mappings)")
@@ -356,6 +385,12 @@ export async function saveConfig(input: ConfigInput, actor: string): Promise<App
   const timezone = (input.timezone ?? current.timezone).trim() || "Australia/Sydney";
   try { new Intl.DateTimeFormat("en-AU", { timeZone: timezone }).format(new Date()); }
   catch { throw new HttpError(400, "Enter a valid IANA calendar time zone"); }
+  if (input.syncPolicy?.secondaryCalendars !== undefined) {
+    if (!Array.isArray(input.syncPolicy.secondaryCalendars)) throw new HttpError(400, "Secondary calendar destinations must be a list");
+    const names = input.syncPolicy.secondaryCalendars.map((calendar) => calendar?.name?.trim().toLocaleLowerCase("en-AU") ?? "");
+    if (names.some((name) => !name)) throw new HttpError(400, "Give every secondary calendar destination a name");
+    if (new Set(names).size !== names.length) throw new HttpError(400, "Each secondary calendar destination needs a unique name");
+  }
   const syncPolicy = normalizeSyncPolicy(input.syncPolicy ?? {}, current.syncPolicy);
   const tokenEncrypted = input.schoolboxToken
     ? await encryptSecret(input.schoolboxToken.trim())
@@ -714,32 +749,67 @@ export async function getEventMappings(googleUserId: string): Promise<EventMappi
   await ensureSchema();
   const result = await db()
     .prepare(`SELECT google_user_id AS googleUserId, source_key AS sourceKey, google_event_id AS googleEventId,
-      source_hash AS sourceHash, source_start AS sourceStart, source_end AS sourceEnd, last_seen_run_id AS lastSeenRunId,
+      calendar_id AS calendarId, source_hash AS sourceHash, source_start AS sourceStart, source_end AS sourceEnd, last_seen_run_id AS lastSeenRunId,
       created_at AS createdAt, updated_at AS updatedAt FROM event_mappings WHERE google_user_id = ?`)
     .bind(googleUserId)
     .all<EventMapping>();
   return result.results;
 }
 
-export async function upsertEventMapping(mapping: EventMapping): Promise<void> {
+export async function upsertEventMapping(mapping: Omit<EventMapping, "calendarId"> & { calendarId?: string }): Promise<void> {
   await ensureSchema();
   await db()
     .prepare(`INSERT INTO event_mappings
-      (google_user_id, source_key, google_event_id, source_hash, source_start, source_end, last_seen_run_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (google_user_id, source_key, google_event_id, calendar_id, source_hash, source_start, source_end, last_seen_run_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(google_user_id, source_key) DO UPDATE SET google_event_id=excluded.google_event_id,
-      source_hash=excluded.source_hash, source_start=excluded.source_start, source_end=excluded.source_end,
+      calendar_id=excluded.calendar_id, source_hash=excluded.source_hash, source_start=excluded.source_start, source_end=excluded.source_end,
       last_seen_run_id=excluded.last_seen_run_id, updated_at=excluded.updated_at`)
     .bind(
       mapping.googleUserId,
       mapping.sourceKey,
       mapping.googleEventId,
+      mapping.calendarId?.trim() || "primary",
       mapping.sourceHash,
       mapping.sourceStart,
       mapping.sourceEnd,
       mapping.lastSeenRunId,
       mapping.createdAt,
       mapping.updatedAt,
+    )
+    .run();
+}
+
+export async function getUserCalendarTarget(
+  googleUserId: string,
+  destinationId: string,
+): Promise<UserCalendarTarget | null> {
+  await ensureSchema();
+  return db().prepare(`SELECT google_user_id AS googleUserId, destination_id AS destinationId,
+    google_calendar_id AS googleCalendarId, summary, description, time_zone AS timeZone,
+    created_at AS createdAt, updated_at AS updatedAt
+    FROM user_calendar_targets WHERE google_user_id = ? AND destination_id = ?`)
+    .bind(googleUserId, destinationId)
+    .first<UserCalendarTarget>();
+}
+
+export async function upsertUserCalendarTarget(target: UserCalendarTarget): Promise<void> {
+  await ensureSchema();
+  await db().prepare(`INSERT INTO user_calendar_targets
+    (google_user_id, destination_id, google_calendar_id, summary, description, time_zone, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(google_user_id, destination_id) DO UPDATE SET
+      google_calendar_id=excluded.google_calendar_id, summary=excluded.summary,
+      description=excluded.description, time_zone=excluded.time_zone, updated_at=excluded.updated_at`)
+    .bind(
+      target.googleUserId,
+      target.destinationId,
+      target.googleCalendarId,
+      target.summary,
+      target.description,
+      target.timeZone,
+      target.createdAt,
+      target.updatedAt,
     )
     .run();
 }

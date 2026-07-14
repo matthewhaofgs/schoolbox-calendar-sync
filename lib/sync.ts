@@ -8,7 +8,11 @@ import {
   type GoogleDirectoryUser,
 } from "./google";
 import { SchoolboxClient, type NormalizedSchoolboxCalendarEvent, type SchoolboxUser } from "./schoolbox";
-import { eventIncludedByPolicy, type SyncPolicy } from "./policy";
+import {
+  eventIncludedByPolicy,
+  resolveGoogleEventRule,
+  type SyncPolicy,
+} from "./policy";
 import {
   addAudit,
   createRun,
@@ -17,6 +21,7 @@ import {
   finishRun,
   getConfig,
   getEventMappings,
+  getUserCalendarTarget,
   getUserMapping,
   listRuns,
   recordManagedEventCleanup,
@@ -26,6 +31,7 @@ import {
   touchRunHeartbeat,
   touchEventMapping,
   upsertEventMapping,
+  upsertUserCalendarTarget,
   upsertUserMapping,
   type RunSummary,
 } from "./storage";
@@ -33,7 +39,7 @@ import { HttpError } from "./security";
 
 type MatchedUser = { google: GoogleDirectoryUser; schoolbox: SchoolboxUser };
 type SchoolboxSyncClient = Pick<SchoolboxClient, "getAllUsers" | "getCalendarEvents">;
-type GoogleSyncClient = Pick<GoogleWorkspaceClient, "listAllUsers" | "insertEvent" | "updateEvent" | "deleteEvent">;
+type GoogleSyncClient = Pick<GoogleWorkspaceClient, "listAllUsers" | "createCalendar" | "updateCalendar" | "insertEvent" | "updateEvent" | "deleteEvent">;
 type GoogleCleanupClient = Pick<GoogleWorkspaceClient, "deleteEvent">;
 
 /** Optional client overrides used by deterministic integration tests. */
@@ -93,6 +99,7 @@ export async function eventBody(
 ): Promise<GoogleCalendarEventInput & { id: string }> {
   const id = await createDeterministicEventId(`${googleUserId}:${sourceKey}`);
   const sourceLink = event.sourceUrl;
+  const googleRule = resolveGoogleEventRule({ category: event.category ?? "other", type: event.type }, policy);
   const descriptionParts = [
     policy.includeDescription ? event.description : undefined,
     policy.includeEventTypeInDescription && event.type ? `Schoolbox type: ${event.type}` : undefined,
@@ -116,14 +123,14 @@ export async function eventBody(
     },
   };
   if (policy.includeSchoolboxLink && sourceLink) body.source = { title: "Open in Schoolbox", url: sourceLink };
-  if (policy.visibility !== "default") body.visibility = policy.visibility;
-  if (policy.transparency !== "opaque") body.transparency = policy.transparency;
-  if (policy.colorId) body.colorId = policy.colorId;
-  if (policy.reminderMode === "none") body.reminders = { useDefault: false };
-  if (policy.reminderMode === "custom") {
+  if (googleRule.visibility !== "default") body.visibility = googleRule.visibility;
+  if (googleRule.transparency !== "opaque") body.transparency = googleRule.transparency;
+  if (googleRule.colorId) body.colorId = googleRule.colorId;
+  if (googleRule.reminderMode === "none") body.reminders = { useDefault: false };
+  if (googleRule.reminderMode === "custom") {
     body.reminders = {
       useDefault: false,
-      overrides: [{ method: policy.reminderMethod, minutes: policy.reminderMinutes }],
+      overrides: [{ method: googleRule.reminderMethod, minutes: googleRule.reminderMinutes }],
     };
   }
   return body;
@@ -139,6 +146,59 @@ async function processInPool<T>(items: T[], concurrency: number, worker: (item: 
     }
   });
   await Promise.all(runners);
+}
+
+async function resolveCalendarId(options: {
+  destinationId: string;
+  googleUserId: string;
+  googleEmail: string;
+  timezone: string;
+  policy: SyncPolicy;
+  google: GoogleSyncClient;
+}): Promise<string> {
+  if (options.destinationId === "primary") return "primary";
+  const definition = options.policy.secondaryCalendars.find((calendar) => calendar.id === options.destinationId);
+  if (!definition) throw new Error(`Calendar destination ${options.destinationId} is no longer configured.`);
+
+  const existing = await getUserCalendarTarget(options.googleUserId, definition.id);
+  const expected = {
+    summary: definition.name,
+    description: definition.description,
+    timeZone: options.timezone,
+  };
+  const now = new Date().toISOString();
+  if (existing) {
+    if (
+      existing.summary !== expected.summary ||
+      existing.description !== expected.description ||
+      existing.timeZone !== expected.timeZone
+    ) {
+      await options.google.updateCalendar(options.googleEmail, existing.googleCalendarId, expected, {
+        quotaUser: options.googleUserId,
+      });
+      await upsertUserCalendarTarget({
+        ...existing,
+        ...expected,
+        updatedAt: now,
+      });
+    }
+    return existing.googleCalendarId;
+  }
+
+  const created = await options.google.createCalendar(options.googleEmail, expected, {
+    quotaUser: options.googleUserId,
+  });
+  const googleCalendarId = created.id?.trim();
+  if (!googleCalendarId) throw new Error("Google created a secondary calendar without returning its identifier.");
+  await upsertUserCalendarTarget({
+    googleUserId: options.googleUserId,
+    destinationId: definition.id,
+    googleCalendarId,
+    ...expected,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return googleCalendarId;
 }
 
 async function syncUser(
@@ -176,7 +236,23 @@ async function syncUser(
     const seen = new Set<string>();
     const excluded = new Set<string>();
     const excludedSourceRoots = new Set<string>();
+    const calendarTargets = new Map<string, Promise<string>>();
     await recordDiscoveredEventTypes(events);
+
+    const targetFor = (destinationId: string) => {
+      const cached = calendarTargets.get(destinationId);
+      if (cached) return cached;
+      const target = resolveCalendarId({
+        destinationId,
+        googleUserId,
+        googleEmail,
+        timezone: options.timezone,
+        policy: options.syncPolicy,
+        google,
+      });
+      calendarTargets.set(destinationId, target);
+      return target;
+    };
 
     for (const event of events) {
       const sourceKey = `${event.sourceKey}:occurrence:${event.start}`;
@@ -192,48 +268,67 @@ async function syncUser(
         continue;
       }
       seen.add(sourceKey);
+      const googleRule = resolveGoogleEventRule({ category: event.category ?? "other", type: event.type }, options.syncPolicy);
+      const calendarId = await targetFor(googleRule.destinationId);
       const body = await eventBody(event, googleUserId, options.timezone, sourceKey, options.syncPolicy);
       const hash = await createContentHash(body);
       const mapping = existing.get(sourceKey);
+      const calendarChanged = Boolean(mapping && mapping.calendarId !== calendarId);
 
-      if (mapping?.sourceHash === hash) {
+      if (mapping?.sourceHash === hash && !calendarChanged) {
         await touchEventMapping(googleUserId, sourceKey, run.id);
         run.eventsUnchanged += 1;
         continue;
       }
 
       let createdAt = mapping?.createdAt ?? new Date().toISOString();
-      if (mapping) {
+      if (mapping && !calendarChanged) {
         await google.updateEvent(googleEmail, mapping.googleEventId, body, {
-          calendarId: "primary",
+          calendarId,
           quotaUser: googleUserId,
           sendUpdates: "none",
         });
         run.eventsUpdated += 1;
       } else {
+        let insertConflict = false;
         try {
           await google.insertEvent(googleEmail, body, {
-            calendarId: "primary",
+            calendarId,
             quotaUser: googleUserId,
             sendUpdates: "none",
           });
-          run.eventsCreated += 1;
         } catch (error) {
           if (!(error instanceof GoogleApiError) || error.status !== 409) throw error;
+          insertConflict = true;
           await google.updateEvent(googleEmail, body.id, body, {
-            calendarId: "primary",
+            calendarId,
             quotaUser: googleUserId,
             sendUpdates: "none",
           });
-          run.eventsUpdated += 1;
           createdAt = new Date().toISOString();
+        }
+        if (mapping) {
+          try {
+            await google.deleteEvent(googleEmail, mapping.googleEventId, {
+              calendarId: mapping.calendarId,
+              quotaUser: googleUserId,
+              sendUpdates: "none",
+            });
+          } catch (error) {
+            if (!(error instanceof GoogleApiError) || (error.status !== 404 && error.status !== 410)) throw error;
+          }
+          run.eventsUpdated += 1;
+        } else {
+          if (insertConflict) run.eventsUpdated += 1;
+          else run.eventsCreated += 1;
         }
       }
 
       await upsertEventMapping({
         googleUserId,
         sourceKey,
-        googleEventId: mapping?.googleEventId ?? body.id,
+        googleEventId: body.id,
+        calendarId,
         sourceHash: hash,
         sourceStart: event.start,
         sourceEnd: event.end,
@@ -255,7 +350,7 @@ async function syncUser(
       if (!wasInsideFetchedWindow) continue;
       try {
         await google.deleteEvent(googleEmail, mapping.googleEventId, {
-          calendarId: "primary",
+          calendarId: mapping.calendarId,
           quotaUser: googleUserId,
           sendUpdates: "none",
         });
@@ -356,7 +451,7 @@ export async function cleanupUserManagedEvents(
   for (const eventMapping of storedMappings) {
     try {
       await google.deleteEvent(mapping.googleEmail, eventMapping.googleEventId, {
-        calendarId: "primary",
+        calendarId: eventMapping.calendarId,
         quotaUser: userId,
         sendUpdates: "none",
       });
