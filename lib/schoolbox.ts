@@ -374,6 +374,35 @@ function timedDate(value: string, field: string): string {
     : trimmed;
 }
 
+function shiftTimedDate(value: string, minutes: number): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) throw new TypeError("Schoolbox event date-time cannot be repaired.");
+
+  const shifted = new Date(timestamp + minutes * 60_000);
+  const offset = value.match(/(Z|[+-]\d{2}:\d{2})$/i)?.[1];
+  if (!offset) {
+    // A date-time without an offset is interpreted later using the configured
+    // Google calendar time zone, so retain the same wall-clock representation.
+    const wallClock = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
+    if (!wallClock) return shifted.toISOString();
+    const wallClockTimestamp = Date.UTC(
+      Number(wallClock[1]),
+      Number(wallClock[2]) - 1,
+      Number(wallClock[3]),
+      Number(wallClock[4]),
+      Number(wallClock[5]),
+      Number(wallClock[6] ?? 0),
+    ) + minutes * 60_000;
+    return new Date(wallClockTimestamp).toISOString().slice(0, 19);
+  }
+  if (offset.toUpperCase() === "Z") return shifted.toISOString();
+
+  const sign = offset.startsWith("-") ? -1 : 1;
+  const offsetMinutes = sign * (Number(offset.slice(1, 3)) * 60 + Number(offset.slice(4, 6)));
+  const localTime = new Date(shifted.getTime() + offsetMinutes * 60_000).toISOString().slice(0, 19);
+  return `${localTime}${offset}`;
+}
+
 function decodeHtmlEntities(input: string): string {
   const namedEntities: Record<string, string> = {
     amp: "&",
@@ -501,15 +530,35 @@ export function normalizeSchoolboxCalendarEvent(
   let start: string;
   let end: string;
   if (raw.allDay) {
-    start = dateOnly(raw.start, "start");
-    end = dateOnly(raw.end, "end");
+    const rawStart = raw.start.trim();
+    const rawEnd = raw.end.trim();
+    if (!rawStart && !rawEnd) {
+      throw new TypeError("Schoolbox event has neither a start nor an end date.");
+    }
+    if (rawStart) {
+      start = dateOnly(rawStart, "start");
+      end = rawEnd ? dateOnly(rawEnd, "end") : addUtcDays(start, 1);
+    } else {
+      end = dateOnly(rawEnd, "end");
+      start = addUtcDays(end, -1);
+    }
     // FullCalendar and Google Calendar both use an exclusive all-day end date.
     if (end <= start) {
       end = addUtcDays(start, 1);
     }
   } else {
-    start = timedDate(raw.start, "start");
-    end = timedDate(raw.end, "end");
+    const rawStart = raw.start.trim();
+    const rawEnd = raw.end.trim();
+    if (!rawStart && !rawEnd) {
+      throw new TypeError("Schoolbox event has neither a start nor an end date-time.");
+    }
+    if (rawStart) {
+      start = timedDate(rawStart, "start");
+      end = rawEnd ? timedDate(rawEnd, "end") : shiftTimedDate(start, 30);
+    } else {
+      end = timedDate(rawEnd, "end");
+      start = shiftTimedDate(end, -30);
+    }
   }
 
   const fallbackIdentity = JSON.stringify([
@@ -678,15 +727,15 @@ function validateRawCalendarEvent(value: unknown, index: number): RawSchoolboxCa
     throw new TypeError(`Schoolbox calendar event at index ${index} is not an object.`);
   }
 
-  if (typeof value.start !== "string" || typeof value.end !== "string") {
-    throw new TypeError(`Schoolbox calendar event at index ${index} has no valid start/end.`);
+  if ((value.start != null && typeof value.start !== "string") || (value.end != null && typeof value.end !== "string")) {
+    throw new TypeError(`Schoolbox calendar event at index ${index} has an invalid start/end type.`);
   }
 
   return {
     ...value,
     title: typeof value.title === "string" ? value.title : "",
-    start: value.start,
-    end: value.end,
+    start: typeof value.start === "string" ? value.start : "",
+    end: typeof value.end === "string" ? value.end : "",
     editable: asBoolean(value.editable),
     allDay: asBoolean(value.allDay),
   } as RawSchoolboxCalendarEvent;

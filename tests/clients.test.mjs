@@ -47,6 +47,48 @@ test("repairs an invalid all-day exclusive end date", () => {
   assert.equal(event.end, "2026-08-04");
 });
 
+test("repairs a missing timed boundary with a 30 minute duration", () => {
+  const missingEnd = normalizeSchoolboxCalendarEvent(
+    { title: "Due item", start: "2026-08-14T09:00:00+10:00", end: "", editable: false, allDay: false },
+    2,
+  );
+  assert.equal(missingEnd.start, "2026-08-14T09:00:00+10:00");
+  assert.equal(missingEnd.end, "2026-08-14T09:30:00+10:00");
+
+  const missingStart = normalizeSchoolboxCalendarEvent(
+    { title: "Due item", start: "", end: "2026-08-14T09:00:00+10:00", editable: false, allDay: false },
+    2,
+  );
+  assert.equal(missingStart.start, "2026-08-14T08:30:00+10:00");
+  assert.equal(missingStart.end, "2026-08-14T09:00:00+10:00");
+});
+
+test("repairs a missing all-day boundary as one calendar day", () => {
+  const missingEnd = normalizeSchoolboxCalendarEvent(
+    { title: "Closure", start: "2026-08-14", end: "", editable: false, allDay: true },
+    2,
+  );
+  assert.equal(missingEnd.start, "2026-08-14");
+  assert.equal(missingEnd.end, "2026-08-15");
+
+  const missingStart = normalizeSchoolboxCalendarEvent(
+    { title: "Closure", start: "", end: "2026-08-15", editable: false, allDay: true },
+    2,
+  );
+  assert.equal(missingStart.start, "2026-08-14");
+  assert.equal(missingStart.end, "2026-08-15");
+});
+
+test("rejects an event with no date anchor", () => {
+  assert.throws(
+    () => normalizeSchoolboxCalendarEvent(
+      { title: "Undated", start: "", end: "", editable: false, allDay: false },
+      2,
+    ),
+    /neither a start nor an end date-time/,
+  );
+});
+
 test("Schoolbox user pagination follows cursor metadata", async () => {
   const requests = [];
   const client = new SchoolboxClient({
