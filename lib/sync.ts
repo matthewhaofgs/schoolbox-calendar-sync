@@ -62,24 +62,34 @@ function normalizedEmail(value: string | null | undefined): string {
 
 /**
  * Index active Schoolbox users by either primary or alternate email.
- * Ambiguous addresses are deliberately omitted so Relay cannot associate a
- * Google account with the wrong Schoolbox identity.
+ * A unique primary match takes precedence. Alternate emails are considered
+ * only where no primary match exists, and ambiguous addresses at either level
+ * are omitted so Relay cannot associate the wrong Schoolbox identity.
  */
 export function indexActiveSchoolboxUsersByEmail(users: SchoolboxUser[]): Map<string, SchoolboxUser> {
-  const candidates = new Map<string, Map<number, SchoolboxUser>>();
+  const primary = new Map<string, Map<number, SchoolboxUser>>();
+  const alternate = new Map<string, Map<number, SchoolboxUser>>();
   for (const user of users.filter(isSchoolboxActive)) {
-    for (const value of [user.email, user.altEmail]) {
+    for (const [source, value] of [[primary, user.email], [alternate, user.altEmail]] as const) {
       const email = normalizedEmail(value);
       if (!email) continue;
-      const usersForEmail = candidates.get(email) ?? new Map<number, SchoolboxUser>();
+      const usersForEmail = source.get(email) ?? new Map<number, SchoolboxUser>();
       usersForEmail.set(user.id, user);
-      candidates.set(email, usersForEmail);
+      source.set(email, usersForEmail);
     }
   }
 
   const unique = new Map<string, SchoolboxUser>();
-  for (const [email, usersForEmail] of candidates) {
-    if (usersForEmail.size === 1) unique.set(email, usersForEmail.values().next().value!);
+  const emails = new Set([...primary.keys(), ...alternate.keys()]);
+  for (const email of emails) {
+    const primaryUsers = primary.get(email);
+    if (primaryUsers?.size === 1) {
+      unique.set(email, primaryUsers.values().next().value!);
+      continue;
+    }
+    if (primaryUsers && primaryUsers.size > 1) continue;
+    const alternateUsers = alternate.get(email);
+    if (alternateUsers?.size === 1) unique.set(email, alternateUsers.values().next().value!);
   }
   return unique;
 }

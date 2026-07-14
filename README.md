@@ -180,7 +180,7 @@ Relay discovers every active Google Workspace identity on each run, records its 
 - Open **People** to search and filter all discovered users, toggle one user, or select visible rows for a bulk enable/pause action.
 - **Remove Relay events** pauses that user and deletes only events recorded in Relay's managed-event mapping table. Other Google Calendar entries are never selected for deletion.
 - Open **Settings > People** to choose whether users discovered in future start enabled or paused. Changing this default never changes existing selections.
-- Google Workspace accounts without a unique active Schoolbox primary or alternate email match are labelled **Unmatched** as an informational state. This is expected for former staff, service accounts, and other Google-only identities. Duplicate Schoolbox addresses are also left unmatched to prevent an unsafe identity association.
+- Google Workspace accounts without a unique active Schoolbox primary or alternate email match are labelled **Unmatched** as an informational state. This is expected for former staff, service accounts, and other Google-only identities. A unique primary Schoolbox email takes precedence; ambiguous addresses at the same match level are left unmatched to prevent an unsafe identity association.
 - Pausing a user stops future updates; it does not remove Relay-created events already present in Google Calendar.
 - Viewer and Operator accounts can see coverage. Administrator and local-administrator accounts can change it.
 - Existing installations migrate existing users and the new-user default to enabled, preserving the previous sync-all behaviour.
