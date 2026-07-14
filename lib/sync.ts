@@ -23,6 +23,7 @@ import {
   getEventMappings,
   getUserCalendarTarget,
   getUserMapping,
+  listUserCalendarTargets,
   listRuns,
   recordManagedEventCleanup,
   recoverStaleRuns,
@@ -34,6 +35,7 @@ import {
   upsertUserCalendarTarget,
   upsertUserMapping,
   type RunSummary,
+  type UserCalendarTarget,
 } from "./storage";
 import { HttpError } from "./security";
 
@@ -235,6 +237,40 @@ async function resolveCalendarId(options: {
   return googleCalendarId;
 }
 
+async function reconcileExistingCalendarTargets(options: {
+  targets: UserCalendarTarget[];
+  googleUserId: string;
+  googleEmail: string;
+  timezone: string;
+  policy: SyncPolicy;
+  google: GoogleSyncClient;
+}): Promise<void> {
+  const configured = new Map(options.policy.secondaryCalendars.map((calendar) => [calendar.id, calendar]));
+  for (const target of options.targets) {
+    const definition = configured.get(target.destinationId);
+    if (!definition) continue;
+    const expected = {
+      summary: definition.name,
+      description: definition.description,
+      timeZone: options.timezone,
+    };
+    if (
+      target.summary === expected.summary &&
+      target.description === expected.description &&
+      target.timeZone === expected.timeZone
+    ) continue;
+
+    await options.google.updateCalendar(options.googleEmail, target.googleCalendarId, expected, {
+      quotaUser: options.googleUserId,
+    });
+    await upsertUserCalendarTarget({
+      ...target,
+      ...expected,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+}
+
 async function syncUser(
   match: MatchedUser,
   run: RunSummary,
@@ -258,14 +294,23 @@ async function syncUser(
   };
 
   try {
-    const [events, storedMappings] = await Promise.all([
+    const [events, storedMappings, storedCalendarTargets] = await Promise.all([
       schoolbox.getCalendarEvents(match.schoolbox.id, {
         pastDays: options.pastDays,
         futureDays: options.futureDays,
         now,
       }),
       getEventMappings(googleUserId),
+      listUserCalendarTargets(googleUserId),
     ]);
+    await reconcileExistingCalendarTargets({
+      targets: storedCalendarTargets,
+      googleUserId,
+      googleEmail,
+      timezone: options.timezone,
+      policy: options.syncPolicy,
+      google,
+    });
     const existing = new Map(storedMappings.map((mapping) => [mapping.sourceKey, mapping]));
     const seen = new Set<string>();
     const excluded = new Set<string>();

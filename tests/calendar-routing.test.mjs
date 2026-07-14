@@ -79,10 +79,22 @@ test("per-type routing lazily creates a secondary calendar and safely moves mana
   assert.equal((await storage.getEventMappings("google-pilot"))[0].calendarId, "google-secondary-calendar");
 
   await storage.saveConfig({
-    syncPolicy: { eventTypeOverrides: { lesson: { destinationId: "primary", transparency: "opaque", colorId: "" } } },
+    syncPolicy: {
+      secondaryCalendars: [{ id: "learning", name: "Learning Hub", description: "Renamed managed learning events" }],
+      eventTypeOverrides: { lesson: { destinationId: "primary", transparency: "opaque", colorId: "" } },
+    },
   }, "test:administrator");
   const movedRun = await runFullSync("test", "test:runner", clients);
   assert.equal(movedRun.eventsUpdated, 1);
+  assert.deepEqual(calls.calendarsUpdated, [{
+    calendarId: "google-secondary-calendar",
+    calendar: {
+      summary: "Learning Hub",
+      description: "Renamed managed learning events",
+      timeZone: "Australia/Sydney",
+    },
+  }], "an existing destination is renamed even when this run routes no events to it");
+  assert.equal((await storage.getUserCalendarTarget("google-pilot", "learning")).summary, "Learning Hub");
   assert.equal(calls.inserted.at(-1).options.calendarId, "primary", "the new copy is written before the old copy is deleted");
   assert.equal(calls.deleted.at(-1).options.calendarId, "google-secondary-calendar");
   assert.equal((await storage.getEventMappings("google-pilot"))[0].calendarId, "primary");

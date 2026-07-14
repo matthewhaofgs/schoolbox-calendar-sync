@@ -793,6 +793,16 @@ export async function getUserCalendarTarget(
     .first<UserCalendarTarget>();
 }
 
+export async function listUserCalendarTargets(googleUserId: string): Promise<UserCalendarTarget[]> {
+  await ensureSchema();
+  return db().prepare(`SELECT google_user_id AS googleUserId, destination_id AS destinationId,
+    google_calendar_id AS googleCalendarId, summary, description, time_zone AS timeZone,
+    created_at AS createdAt, updated_at AS updatedAt
+    FROM user_calendar_targets WHERE google_user_id = ? ORDER BY destination_id`)
+    .bind(googleUserId)
+    .all<UserCalendarTarget>().results;
+}
+
 export async function upsertUserCalendarTarget(target: UserCalendarTarget): Promise<void> {
   await ensureSchema();
   await db().prepare(`INSERT INTO user_calendar_targets

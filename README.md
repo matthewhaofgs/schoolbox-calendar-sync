@@ -200,7 +200,7 @@ Exact-type rules can override inclusion, destination, visibility, availability, 
 | Reconciliation | Removal of missing or newly excluded managed events |
 | Advanced | Scheduler state and per-user concurrency |
 
-Secondary calendars are created lazily per user when an included event targets the destination. Relay stores the returned calendar ID for each user. Destination changes create the managed event in the new calendar before deleting the prior copy. Removing a destination from Relay does not delete the Google calendar.
+Secondary calendars are created lazily per user when an included event targets the destination. Relay stores the returned calendar ID for each user. Destination name, description, and time-zone changes are applied to existing calendars during the next enabled-user sync. Routing changes create the managed event in the new calendar before deleting the prior copy. Removing a destination from Relay does not delete the Google calendar.
 
 Schoolbox API date ranges are divided into month-sized requests. Events with one missing timed boundary are normalized to a 30-minute duration; events with one missing all-day boundary are normalized to one calendar day.
 
