@@ -38,11 +38,19 @@ export async function PATCH(request: Request) {
 export async function DELETE(request: Request) {
   try {
     const actor = await requestActor(request, "configure");
-    const body = await request.json() as { userId?: unknown };
+    const body = await request.json() as { userId?: unknown; deleteCalendars?: unknown };
     if (typeof body.userId !== "string" || !body.userId.trim()) {
       throw new HttpError(400, "Choose a user to clean up");
     }
-    return Response.json(await cleanupUserManagedEvents(body.userId, actor));
+    if (body.deleteCalendars !== undefined && typeof body.deleteCalendars !== "boolean") {
+      throw new HttpError(400, "Choose whether Relay-created calendars should be deleted");
+    }
+    return Response.json(await cleanupUserManagedEvents(
+      body.userId,
+      actor,
+      undefined,
+      { deleteCalendars: body.deleteCalendars === true },
+    ));
   } catch (error) {
     return jsonError(error);
   }

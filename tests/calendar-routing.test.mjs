@@ -11,7 +11,7 @@ process.env.CONFIG_ENCRYPTION_KEY = randomBytes(32).toString("base64");
 process.env.NODE_ENV = "test";
 
 const storage = await import("../lib/storage.ts");
-const { runFullSync } = await import("../lib/sync.ts");
+const { retireCalendarDestination, runFullSync } = await import("../lib/sync.ts");
 const { db } = await import("../lib/db.ts");
 
 await storage.saveConfig({
@@ -33,7 +33,7 @@ await storage.saveConfig({
   },
 }, "test:setup");
 
-const calls = { calendarsCreated: [], calendarsUpdated: [], inserted: [], updated: [], deleted: [] };
+const calls = { calendarsCreated: [], calendarsUpdated: [], calendarsDeleted: [], inserted: [], updated: [], deleted: [] };
 const clients = {
   schoolbox: {
     async getAllUsers() { return [{ id: 101, email: "pilot@example.edu", enabled: true }]; },
@@ -59,6 +59,7 @@ const clients = {
       return { id: "google-secondary-calendar" };
     },
     async updateCalendar(_email, calendarId, calendar) { calls.calendarsUpdated.push({ calendarId, calendar }); },
+    async deleteCalendar(_email, calendarId) { calls.calendarsDeleted.push(calendarId); },
     async insertEvent(_email, event, options) { calls.inserted.push({ event, options }); },
     async updateEvent(_email, eventId, event, options) { calls.updated.push({ eventId, event, options }); },
     async deleteEvent(_email, eventId, options) { calls.deleted.push({ eventId, options }); },
@@ -98,6 +99,67 @@ test("per-type routing lazily creates a secondary calendar and safely moves mana
   assert.equal(calls.inserted.at(-1).options.calendarId, "primary", "the new copy is written before the old copy is deleted");
   assert.equal(calls.deleted.at(-1).options.calendarId, "google-secondary-calendar");
   assert.equal((await storage.getEventMappings("google-pilot"))[0].calendarId, "primary");
+
+  const retirement = await retireCalendarDestination("learning", "test:administrator", clients.google);
+  assert.deepEqual(retirement, {
+    destinationId: "learning",
+    calendarsDeleted: 1,
+    calendarsAlreadyMissing: 0,
+    calendarsFailed: 0,
+    calendarsRemaining: 0,
+    eventMappingsRemoved: 0,
+    error: null,
+  });
+  assert.deepEqual(calls.calendarsDeleted, ["google-secondary-calendar"]);
+  assert.equal((await storage.getConfig(false)).syncPolicy.secondaryCalendars.length, 0);
+  assert.equal(await storage.getUserCalendarTarget("google-pilot", "learning"), null);
+  assert.equal((await storage.getEventMappings("google-pilot"))[0].calendarId, "primary", "retiring a secondary destination must not remove primary-calendar mappings");
+
+  await storage.saveConfig({
+    syncPolicy: {
+      secondaryCalendars: [{ id: "archive", name: "Archive", description: "Retirement retry" }],
+    },
+  }, "test:administrator");
+  const timestamp = new Date().toISOString();
+  await storage.upsertUserCalendarTarget({
+    googleUserId: "google-pilot",
+    destinationId: "archive",
+    googleCalendarId: "google-archive-calendar",
+    summary: "Archive",
+    description: "Retirement retry",
+    timeZone: "Australia/Sydney",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  await storage.upsertEventMapping({
+    googleUserId: "google-pilot",
+    sourceKey: "archive-event",
+    googleEventId: "google-archive-event",
+    calendarId: "google-archive-calendar",
+    sourceHash: "archive-hash",
+    sourceStart: timestamp,
+    sourceEnd: new Date(Date.parse(timestamp) + 30 * 60_000).toISOString(),
+    lastSeenRunId: "archive-run",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const partial = await retireCalendarDestination("archive", "test:administrator", {
+    async deleteCalendar() { throw new Error("simulated calendar deletion failure"); },
+  });
+  assert.equal(partial.calendarsFailed, 1);
+  assert.equal(partial.calendarsRemaining, 1);
+  assert.match(partial.error ?? "", /simulated calendar deletion failure/);
+  assert.equal((await storage.getConfig(false)).syncPolicy.secondaryCalendars.length, 0, "routing is removed before deletion so a sync cannot recreate a partly retired destination");
+  assert.equal((await storage.listCalendarDestinationUsage())[0].destinationId, "archive", "failed targets remain visible for retry");
+
+  const retry = await retireCalendarDestination("archive", "test:administrator", {
+    async deleteCalendar() {},
+  });
+  assert.equal(retry.calendarsDeleted, 1);
+  assert.equal(retry.calendarsRemaining, 0);
+  assert.equal(retry.eventMappingsRemoved, 1);
+  assert.equal((await storage.getEventMappings("google-pilot")).some(mapping => mapping.sourceKey === "archive-event"), false);
+  assert.deepEqual(await storage.listCalendarDestinationUsage(), []);
 });
 
 after(() => {

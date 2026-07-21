@@ -59,8 +59,8 @@ Relay supports one application replica per SQLite database. The Node server list
 - Primary and app-created secondary Google Calendar destinations
 - Per-rule availability, visibility, colour, and reminder configuration
 - Configurable event content and title prefixes
-- Managed-event reconciliation and targeted cleanup
-- Scheduled and manual runs with diagnostics and run history
+- Managed-event reconciliation, per-user cleanup, and managed-calendar retirement
+- Scheduled and manual runs with phase/page diagnostics, progress timestamps, and run history
 - Local break-glass administration and Google Workspace role-based access
 
 ## Requirements
@@ -179,6 +179,7 @@ The first manual run discovers Directory users and Schoolbox matches. Fresh inst
 - Only users with **Calendar sync** enabled are processed.
 - Pausing a user stops future changes but retains existing Relay-managed events.
 - **Remove Relay events** pauses the user and deletes only events recorded in Relay's mapping table.
+- **Delete Relay calendars** first removes tracked events, then permanently deletes only that user&apos;s tracked Relay-created secondary calendars. The primary calendar is never eligible.
 
 ### Event policy
 
@@ -198,11 +199,15 @@ Exact-type rules can override inclusion, destination, visibility, availability, 
 | Event content | Description, location, source link, annotations, and title prefix |
 | Connections | Schoolbox, Google service account, delegated administrator, Directory customer, and time zone |
 | Reconciliation | Removal of missing or newly excluded managed events |
-| Advanced | Scheduler state and per-user concurrency |
+| Advanced | Scheduler state, per-user concurrency, discovery/user/run deadlines |
 
-Secondary calendars are created lazily per user when an included event targets the destination. Relay stores the returned calendar ID for each user. Destination name, description, and time-zone changes are applied to existing calendars during the next enabled-user sync. Routing changes create the managed event in the new calendar before deleting the prior copy. Removing a destination from Relay does not delete the Google calendar.
+Secondary calendars are created lazily per user when an included event targets the destination. Relay stores the returned calendar ID for each user. Destination name, description, and time-zone changes are applied to existing calendars during the next enabled-user sync. Routing changes create the managed event in the new calendar before deleting the prior copy.
+
+Removing routing leaves existing Google calendars in place. **Retire and delete** removes the destination from saved policy, deletes every tracked user copy, and removes its event mappings. Failed deletions remain visible for retry. Calendar deletion is permanent and also removes manually added content inside the deleted secondary calendar; Relay therefore limits this operation to recorded app-created calendar IDs and never targets a primary calendar.
 
 Schoolbox API date ranges are divided into month-sized requests. Events with one missing timed boundary are normalized to a 30-minute duration; events with one missing all-day boundary are normalized to one calendar day.
+
+Run diagnostics distinguish the 30-second process heartbeat from meaningful progress. Discovery records separate Schoolbox and Google page checkpoints, user processing records aggregate completion, and finalization has its own phase. Configurable discovery, per-user, and whole-run deadlines abort stalled network work and ensure an unresolved dependency cannot leave a run permanently active.
 
 ## Authentication and authorization
 

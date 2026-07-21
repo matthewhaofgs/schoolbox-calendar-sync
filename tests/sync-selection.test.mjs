@@ -40,6 +40,7 @@ const calls = {
   insertedFor: [],
   updatedFor: [],
   deletedFor: [],
+  deletedCalendarsFor: [],
 };
 
 const clients = {
@@ -74,6 +75,9 @@ const clients = {
     async deleteEvent(userEmail) {
       calls.deletedFor.push(userEmail);
     },
+    async deleteCalendar(userEmail, calendarId) {
+      calls.deletedCalendarsFor.push({ userEmail, calendarId });
+    },
   },
 };
 
@@ -102,6 +106,18 @@ test("runFullSync never processes paused matches and does process enabled matche
   assert.equal(mappings.get("google-paused")?.syncEnabled, false);
   assert.equal(mappings.get("google-paused")?.lastSyncAt, null);
 
+  const targetTimestamp = new Date().toISOString();
+  await storage.upsertUserCalendarTarget({
+    googleUserId: "google-enabled",
+    destinationId: "pilot-events",
+    googleCalendarId: "google-pilot-calendar",
+    summary: "Pilot events",
+    description: "Test calendar",
+    timeZone: "Australia/Sydney",
+    createdAt: targetTimestamp,
+    updatedAt: targetTimestamp,
+  });
+
   const cleanup = await cleanupUserManagedEvents(
     "google-enabled",
     "local:administrator",
@@ -112,6 +128,9 @@ test("runFullSync never processes paused matches and does process enabled matche
     deleted: 1,
     alreadyMissing: 0,
     remaining: 0,
+    calendarsDeleted: 0,
+    calendarsAlreadyMissing: 0,
+    calendarsRemaining: 1,
     error: null,
   });
   assert.deepEqual(calls.deletedFor, ["enabled@example.edu"]);
@@ -120,17 +139,49 @@ test("runFullSync never processes paused matches and does process enabled matche
   assert.equal(cleanedUser?.syncEnabled, false, "cleanup must pause the user before removing events");
   assert.equal(cleanedUser?.eventCount, 0);
   assert.equal(cleanedUser?.status, "pending");
+  assert.equal(cleanedUser?.calendarCount, 1, "event-only cleanup must retain Relay-created calendars");
+
+  const calendarCleanup = await cleanupUserManagedEvents(
+    "google-enabled",
+    "local:administrator",
+    clients.google,
+    { deleteCalendars: true },
+  );
+  assert.equal(calendarCleanup.calendarsDeleted, 1);
+  assert.equal(calendarCleanup.calendarsRemaining, 0);
+  assert.deepEqual(calls.deletedCalendarsFor, [{
+    userEmail: "enabled@example.edu",
+    calendarId: "google-pilot-calendar",
+  }]);
+  assert.equal((await storage.listUserCalendarTargets("google-enabled")).length, 0);
 
   await storage.setUsersSyncEnabled(["google-enabled"], true, "local:administrator");
   await runFullSync("test", "test:runner", clients);
+  await storage.upsertUserCalendarTarget({
+    googleUserId: "google-enabled",
+    destinationId: "pilot-events",
+    googleCalendarId: "google-pilot-calendar-retry",
+    summary: "Pilot events",
+    description: "Test calendar",
+    timeZone: "Australia/Sydney",
+    createdAt: targetTimestamp,
+    updatedAt: targetTimestamp,
+  });
+  let calendarDeleteAttempted = false;
   const failedCleanup = await cleanupUserManagedEvents(
     "google-enabled",
     "local:administrator",
-    { async deleteEvent() { throw new Error("simulated Google delete failure"); } },
+    {
+      async deleteEvent() { throw new Error("simulated Google delete failure"); },
+      async deleteCalendar() { calendarDeleteAttempted = true; },
+    },
+    { deleteCalendars: true },
   );
   assert.equal(failedCleanup.deleted, 0);
   assert.equal(failedCleanup.remaining, 1, "a failed Google deletion must keep Relay's mapping for retry");
   assert.match(failedCleanup.error ?? "", /simulated Google delete failure/);
+  assert.equal(calendarDeleteAttempted, false, "calendar deletion must wait until tracked event cleanup succeeds");
+  assert.equal(failedCleanup.calendarsRemaining, 1);
   assert.equal((await storage.getEventMappings("google-enabled")).length, 1);
   const cleanupFailureUser = await storage.getUserMapping("google-enabled");
   assert.equal(cleanupFailureUser?.syncEnabled, false);

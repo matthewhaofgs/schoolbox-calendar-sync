@@ -7,6 +7,7 @@ import {
   eventTypeKey,
   normalizeSyncPolicy,
   resolveGoogleEventRule,
+  withoutManagedCalendarDestination,
   type EventCategory,
   type EventTypeFilterMode,
   type GoogleEventRuleOverride,
@@ -65,7 +66,15 @@ type Person = {
   status: "Synced" | "Syncing" | "Pending" | "Unmatched" | "Error";
   syncEnabled: boolean;
   eventCount: number;
+  calendarCount: number;
   lastSync: string;
+};
+
+type CalendarDestinationUsage = {
+  destinationId: string;
+  summary: string;
+  calendarCount: number;
+  eventCount: number;
 };
 
 type Run = {
@@ -79,6 +88,9 @@ type Run = {
   changes: number;
   duration: string;
   note: string;
+  phase: string;
+  phaseDetail: string;
+  progressAt: string | null;
   created?: number;
   updated?: number;
   deleted?: number;
@@ -114,6 +126,7 @@ function normalisePeople(value: unknown): Person[] | null {
       status,
       syncEnabled: row.syncEnabled === undefined ? true : Boolean(row.syncEnabled),
       eventCount: Math.max(0, Number(row.eventCount ?? 0)),
+      calendarCount: Math.max(0, Number(row.calendarCount ?? 0)),
       lastSync: String(row.lastSync ?? row.lastSyncAt ?? row.last_synced_at ?? "Not yet"),
     };
   });
@@ -142,7 +155,10 @@ function normaliseRuns(value: unknown): Run[] | null {
       usersMatched: Number(row.usersMatched ?? usersDiscovered),
       changes: Number(row.changes ?? row.eventsChanged ?? created + updated + deleted),
       duration: String(row.duration ?? (durationMs > 0 ? `${Math.floor(durationMs / 60000)}m ${Math.round(durationMs % 60000 / 1000)}s` : "—")),
-      note: String(row.note ?? row.message ?? "Run details are not available."),
+      note: String(row.note ?? row.message ?? row.phaseDetail ?? "Run details are not available."),
+      phase: String(row.phase ?? (status === "Running" ? "starting" : status === "Failed" ? "failed" : "completed")),
+      phaseDetail: String(row.phaseDetail ?? row.message ?? "No phase detail is available."),
+      progressAt: row.progressAt ? String(row.progressAt) : null,
       created,
       updated,
       deleted,
@@ -209,6 +225,9 @@ export default function Home() {
     googleCustomer: "my_customer",
     timezone: "Australia/Sydney",
     concurrency: "3",
+    discoveryTimeoutSeconds: "120",
+    userSyncTimeoutSeconds: "180",
+    runTimeoutMinutes: "30",
     enabled: false,
     hasSchoolboxToken: false,
     hasGoogleServiceAccount: false,
@@ -321,6 +340,9 @@ export default function Home() {
         interval: String(statusConfig.syncIntervalMinutes ?? current.interval),
         pastDays: String(statusConfig.pastDays ?? current.pastDays),
         futureDays: String(statusConfig.futureDays ?? current.futureDays),
+        discoveryTimeoutSeconds: String(statusConfig.discoveryTimeoutSeconds ?? current.discoveryTimeoutSeconds),
+        userSyncTimeoutSeconds: String(statusConfig.userSyncTimeoutSeconds ?? current.userSyncTimeoutSeconds),
+        runTimeoutMinutes: String(statusConfig.runTimeoutMinutes ?? current.runTimeoutMinutes),
         syncNewUsersByDefault: Boolean(statusConfig.syncNewUsersByDefault ?? current.syncNewUsersByDefault),
         timezone: String(statusConfig.timezone ?? current.timezone),
         enabled: Boolean(statusConfig.enabled ?? current.enabled),
@@ -348,6 +370,9 @@ export default function Home() {
         googleCustomer: String(incoming.googleCustomer ?? current.googleCustomer),
         timezone: String(incoming.timezone ?? current.timezone),
         concurrency: String(incoming.concurrency ?? current.concurrency),
+        discoveryTimeoutSeconds: String(incoming.discoveryTimeoutSeconds ?? current.discoveryTimeoutSeconds),
+        userSyncTimeoutSeconds: String(incoming.userSyncTimeoutSeconds ?? current.userSyncTimeoutSeconds),
+        runTimeoutMinutes: String(incoming.runTimeoutMinutes ?? current.runTimeoutMinutes),
         enabled: Boolean(incoming.enabled ?? current.enabled),
         hasSchoolboxToken: Boolean(incoming.hasSchoolboxToken ?? current.hasSchoolboxToken),
         hasGoogleServiceAccount: Boolean(incoming.hasGoogleServiceAccount ?? current.hasGoogleServiceAccount),
@@ -433,6 +458,9 @@ export default function Home() {
           syncPolicy: config.syncPolicy,
           googleCustomer: config.googleCustomer,
           concurrency: Number(config.concurrency),
+          discoveryTimeoutSeconds: Number(config.discoveryTimeoutSeconds),
+          userSyncTimeoutSeconds: Number(config.userSyncTimeoutSeconds),
+          runTimeoutMinutes: Number(config.runTimeoutMinutes),
           enabled: forceEnabled ?? config.enabled,
           setupCompleted: true,
           timezone: config.timezone,
@@ -454,6 +482,9 @@ export default function Home() {
         googleCustomer: String(saved.googleCustomer ?? current.googleCustomer),
         timezone: String(saved.timezone ?? current.timezone),
         concurrency: String(saved.concurrency ?? current.concurrency),
+        discoveryTimeoutSeconds: String(saved.discoveryTimeoutSeconds ?? current.discoveryTimeoutSeconds),
+        userSyncTimeoutSeconds: String(saved.userSyncTimeoutSeconds ?? current.userSyncTimeoutSeconds),
+        runTimeoutMinutes: String(saved.runTimeoutMinutes ?? current.runTimeoutMinutes),
         enabled: Boolean(saved.enabled ?? current.enabled),
         syncPolicy: normalizeSyncPolicy(saved.syncPolicy, current.syncPolicy),
       }));
@@ -674,7 +705,7 @@ function PanelHead({ title, subtitle, action, onClick }: { title: string; subtit
 }
 
 function RunRow({ run, onClick }: { run: Run; onClick: () => void }) {
-  return <tr><td><button className="table-link" onClick={onClick}>{run.id}</button><small>{run.trigger}</small></td><td>{run.started}</td><td><StatusPill status={run.status} /></td><td>{run.users.toLocaleString()}<small className="cell-detail">of {run.usersDiscovered.toLocaleString()} discovered</small></td><td>{run.changes.toLocaleString()}</td><td>{run.duration}</td><td><button className="row-open" onClick={onClick} aria-label={`Open ${run.id}`}>→</button></td></tr>;
+  return <tr><td><button className="table-link" onClick={onClick}>{run.id}</button><small>{run.trigger}</small></td><td>{run.started}</td><td><StatusPill status={run.status} />{run.status === "Running" && <small className="cell-detail">{run.phase.replaceAll("_", " ")}</small>}</td><td>{run.users.toLocaleString()}<small className="cell-detail">of {run.usersDiscovered.toLocaleString()} discovered</small></td><td>{run.changes.toLocaleString()}</td><td>{run.duration}</td><td><button className="row-open" onClick={onClick} aria-label={`Open ${run.id}`}>→</button></td></tr>;
 }
 
 function StatusPill({ status }: { status: Person["status"] | Run["status"] }) {
@@ -694,6 +725,9 @@ type Config = {
   googleCustomer: string;
   timezone: string;
   concurrency: string;
+  discoveryTimeoutSeconds: string;
+  userSyncTimeoutSeconds: string;
+  runTimeoutMinutes: string;
   enabled: boolean;
   hasSchoolboxToken: boolean;
   hasGoogleServiceAccount: boolean;
@@ -884,43 +918,50 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
       setBusy(false);
     }
   };
-  const cleanupManagedEvents = async (person: Person) => {
-    if (busy || person.eventCount === 0) return;
-    const confirmed = window.confirm(
-      `Pause calendar sync for ${person.name} and remove ${person.eventCount} Relay-managed ${person.eventCount === 1 ? "event" : "events"} from their Google Calendar? Other calendar entries will not be touched.`,
-    );
+  const cleanupManagedEvents = async (person: Person, deleteCalendars = false) => {
+    if (busy || (person.eventCount === 0 && (!deleteCalendars || person.calendarCount === 0))) return;
+    const confirmed = window.confirm(deleteCalendars
+      ? `Pause calendar sync for ${person.name}, remove ${person.eventCount} Relay-managed event(s), then permanently delete ${person.calendarCount} Relay-created secondary calendar(s)? Every event in those calendars, including manually added events, will be permanently deleted. The primary calendar and unrelated calendars will not be touched.`
+      : `Pause calendar sync for ${person.name} and remove ${person.eventCount} Relay-managed ${person.eventCount === 1 ? "event" : "events"} from their Google Calendar? Other calendar entries will not be touched.`);
     if (!confirmed) return;
     setBusy(true);
     try {
       const payload = await fetchJson("/api/users", {
         method: "DELETE",
-        body: JSON.stringify({ userId: person.id }),
+        body: JSON.stringify({ userId: person.id, deleteCalendars }),
       });
       const deleted = Number(payload.deleted ?? 0);
       const alreadyMissing = Number(payload.alreadyMissing ?? 0);
       const remaining = Number(payload.remaining ?? 0);
+      const calendarsDeleted = Number(payload.calendarsDeleted ?? 0);
+      const calendarsAlreadyMissing = Number(payload.calendarsAlreadyMissing ?? 0);
+      const calendarsRemaining = Number(payload.calendarsRemaining ?? person.calendarCount);
       const cleanupError = typeof payload.error === "string" ? payload.error : null;
       setPeople(current => current.map(row => row.id === person.id ? {
         ...row,
         syncEnabled: false,
         eventCount: remaining,
-        status: remaining > 0 ? "Error" : row.status === "Unmatched" ? "Unmatched" : "Pending",
+        calendarCount: calendarsRemaining,
+        status: remaining > 0 || cleanupError ? "Error" : row.status === "Unmatched" ? "Unmatched" : "Pending",
       } : row));
-      if (remaining > 0 || cleanupError) {
-        setNotice({ kind: "error", message: `Cleanup paused this user and removed ${deleted} event(s), but ${remaining} Relay-managed event(s) remain. Retry after checking Google access.` });
+      if (remaining > 0 || (deleteCalendars && calendarsRemaining > 0) || cleanupError) {
+        setNotice({ kind: "error", message: `Cleanup paused this user and removed ${deleted} event(s) and ${calendarsDeleted} calendar(s), but ${remaining} event(s) and ${calendarsRemaining} calendar(s) remain. Retry after checking Google access.` });
       } else {
         const missingNote = alreadyMissing > 0 ? ` ${alreadyMissing} tracked event(s) were already absent.` : "";
-        setNotice({ kind: "success", message: `Calendar sync paused and ${deleted} Relay-managed event(s) removed.${missingNote}` });
+        const calendarNote = deleteCalendars
+          ? ` ${calendarsDeleted} Relay-created calendar(s) deleted.${calendarsAlreadyMissing > 0 ? ` ${calendarsAlreadyMissing} tracked calendar(s) were already absent.` : ""}`
+          : "";
+        setNotice({ kind: "success", message: `Calendar sync paused and ${deleted} Relay-managed event(s) removed.${missingNote}${calendarNote}` });
       }
     } catch (error) {
-      setNotice({ kind: "error", message: error instanceof Error ? error.message : "Relay-managed events could not be removed." });
+      setNotice({ kind: "error", message: error instanceof Error ? error.message : "Relay-managed calendar data could not be removed." });
     } finally {
       setBusy(false);
     }
   };
   const exportCsv = () => {
     const escape = (value: string) => `"${value.replaceAll('"', '""')}"`;
-    const rows = [["Name", "Schoolbox email", "Google email", "Role", "Calendar sync", "Relay-managed events", "Status", "Last sync"], ...filtered.map(person => [person.name, person.schoolboxEmail, person.googleEmail, person.role, person.syncEnabled ? "Enabled" : "Paused", String(person.eventCount), person.status, person.lastSync])];
+    const rows = [["Name", "Schoolbox email", "Google email", "Role", "Calendar sync", "Relay-managed events", "Relay-created calendars", "Status", "Last sync"], ...filtered.map(person => [person.name, person.schoolboxEmail, person.googleEmail, person.role, person.syncEnabled ? "Enabled" : "Paused", String(person.eventCount), String(person.calendarCount), person.status, person.lastSync])];
     const url = URL.createObjectURL(new Blob([rows.map(row => row.map(escape).join(",")).join("\n")], { type: "text/csv;charset=utf-8" }));
     const link = document.createElement("a");
     link.href = url;
@@ -932,8 +973,8 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
     <section className="people-summary"><div><span className="summary-icon green">#</span><p><b>{people.length || counts?.users || 0}</b><small>Discovered</small></p></div><div><span className="summary-icon green">✓</span><p><b>{enabledCount}</b><small>Enabled</small></p></div><div><span className="summary-icon amber">Ⅱ</span><p><b>{pausedCount}</b><small>Paused</small></p></div><div><span className="summary-icon blue">○</span><p><b>{people.length ? people.filter(p => p.status === "Unmatched").length : counts?.unmatched ?? 0}</b><small>Unmatched</small></p></div></section>
     <section className="panel people-panel" aria-busy={busy}><div className="people-tools"><div className="search-box"><span aria-hidden="true">⌕</span><input value={query} onChange={e => { setQuery(e.target.value); setPage(0); setSelected(new Set()); }} placeholder="Search people or email…" aria-label="Search people" /></div><select value={coverageFilter} onChange={e => { setCoverageFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter calendar sync coverage"><option>All coverage</option><option>Enabled</option><option>Paused</option></select><select value={statusFilter} onChange={e => { setStatusFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter sync status"><option>All statuses</option><option>Synced</option><option>Syncing</option><option>Pending</option><option>Unmatched</option><option>Error</option></select><button className="button ghost" onClick={exportCsv}>Export CSV</button></div>
       {canConfigure && selectedVisible > 0 && <div className="people-bulk" role="status"><b>{selectedVisible} selected</b><span>Bulk changes apply only to the selected visible users.</span><button className="button secondary" onClick={() => void updateCoverage(selectedIds, true)} disabled={busy}>Enable selected</button><button className="button ghost" onClick={() => void updateCoverage(selectedIds, false)} disabled={busy}>Pause selected</button></div>}
-      <div className="coverage-note"><span>i</span><p><b>Pausing stops future updates.</b> Existing Relay-created Google events stay in place until you use <strong>Remove Relay events</strong>. That cleanup uses Relay&apos;s event records and leaves every other calendar entry alone.</p></div>
-      <div className="table-wrap"><table className="people-table"><caption className="sr-only">Discovered Google Workspace users and their Schoolbox calendar sync coverage</caption><thead><tr>{canConfigure && <th scope="col" className="selection-column"><input ref={selectAllRef} type="checkbox" checked={visible.length > 0 && selectedVisible === visible.length} onChange={event => selectVisible(event.target.checked)} aria-label="Select visible users" disabled={busy || visible.length === 0} /></th>}<th scope="col">Person</th><th scope="col">Schoolbox identity</th><th scope="col">Google Workspace</th><th scope="col">Role</th><th scope="col">Calendar sync</th><th scope="col">Managed events</th><th scope="col">Status</th><th scope="col">Last sync</th></tr></thead><tbody>{visible.map(person => <tr key={person.id}>{canConfigure && <td className="selection-column"><input type="checkbox" checked={selected.has(person.id)} onChange={event => selectOne(person.id, event.target.checked)} aria-label={`Select ${person.name}`} disabled={busy} /></td>}<th scope="row" className="person-row-header"><div className="person-cell"><span className="person-avatar">{person.name.split(" ").map(part => part[0]).join("").slice(0, 2)}</span><div><b>{person.name}</b><small>{person.id}</small></div></div></th><td>{person.schoolboxEmail}</td><td className={person.googleEmail === "—" ? "muted" : ""}>{person.googleEmail}</td><td>{person.role}</td><td>{canConfigure ? <label className="sync-switch"><input type="checkbox" checked={person.syncEnabled} onChange={event => void updateCoverage([person.id], event.target.checked)} disabled={busy} aria-label={`Sync calendar for ${person.name}`} /><span aria-hidden="true" /><b>{person.syncEnabled ? "Enabled" : "Paused"}</b></label> : <span className={`coverage-state ${person.syncEnabled ? "enabled" : "paused"}`}>{person.syncEnabled ? "Enabled" : "Paused"}</span>}</td><td><div className="managed-events-cell"><b>{person.eventCount}</b>{canConfigure && <button type="button" onClick={() => void cleanupManagedEvents(person)} disabled={busy || person.eventCount === 0} title={person.eventCount === 0 ? "No Relay-managed events to remove" : "Pause this user and remove only Relay-managed events"}>Remove Relay events</button>}</div></td><td><StatusPill status={person.status} /></td><td>{person.lastSync}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state"><b>{loadError ? "People could not be loaded" : people.length === 0 ? "No people discovered yet" : "No people found"}</b><p>{loadError ? "Refresh after checking the server connection and logs." : people.length === 0 ? "Complete setup and run a sync to discover Workspace users. If the new-user default is paused, discovery will not write calendar events." : "Try different search or filter options."}</p></div>}</div>
+      <div className="coverage-note"><span>i</span><p><b>Pausing stops future updates.</b> Remove Relay events leaves every unrelated entry alone. Delete Relay calendars also permanently removes all content inside Relay-created secondary calendars, including manually added entries.</p></div>
+      <div className="table-wrap"><table className="people-table"><caption className="sr-only">Discovered Google Workspace users and their Schoolbox calendar sync coverage</caption><thead><tr>{canConfigure && <th scope="col" className="selection-column"><input ref={selectAllRef} type="checkbox" checked={visible.length > 0 && selectedVisible === visible.length} onChange={event => selectVisible(event.target.checked)} aria-label="Select visible users" disabled={busy || visible.length === 0} /></th>}<th scope="col">Person</th><th scope="col">Schoolbox identity</th><th scope="col">Google Workspace</th><th scope="col">Role</th><th scope="col">Calendar sync</th><th scope="col">Relay data</th><th scope="col">Status</th><th scope="col">Last sync</th></tr></thead><tbody>{visible.map(person => <tr key={person.id}>{canConfigure && <td className="selection-column"><input type="checkbox" checked={selected.has(person.id)} onChange={event => selectOne(person.id, event.target.checked)} aria-label={`Select ${person.name}`} disabled={busy} /></td>}<th scope="row" className="person-row-header"><div className="person-cell"><span className="person-avatar">{person.name.split(" ").map(part => part[0]).join("").slice(0, 2)}</span><div><b>{person.name}</b><small>{person.id}</small></div></div></th><td>{person.schoolboxEmail}</td><td className={person.googleEmail === "—" ? "muted" : ""}>{person.googleEmail}</td><td>{person.role}</td><td>{canConfigure ? <label className="sync-switch"><input type="checkbox" checked={person.syncEnabled} onChange={event => void updateCoverage([person.id], event.target.checked)} disabled={busy} aria-label={`Sync calendar for ${person.name}`} /><span aria-hidden="true" /><b>{person.syncEnabled ? "Enabled" : "Paused"}</b></label> : <span className={`coverage-state ${person.syncEnabled ? "enabled" : "paused"}`}>{person.syncEnabled ? "Enabled" : "Paused"}</span>}</td><td><div className="managed-events-cell"><span><b>{person.eventCount}</b> event(s)</span><span><b>{person.calendarCount}</b> calendar(s)</span>{canConfigure && <button type="button" onClick={() => void cleanupManagedEvents(person)} disabled={busy || person.eventCount === 0} title={person.eventCount === 0 ? "No Relay-managed events to remove" : "Pause this user and remove only Relay-managed events"}>Remove Relay events</button>}{canConfigure && person.calendarCount > 0 && <button type="button" onClick={() => void cleanupManagedEvents(person, true)} disabled={busy} title="Pause this user, remove Relay-managed events, and delete Relay-created secondary calendars">Delete Relay calendars</button>}</div></td><td><StatusPill status={person.status} /></td><td>{person.lastSync}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state"><b>{loadError ? "People could not be loaded" : people.length === 0 ? "No people discovered yet" : "No people found"}</b><p>{loadError ? "Refresh after checking the server connection and logs." : people.length === 0 ? "Complete setup and run a sync to discover Workspace users. If the new-user default is paused, discovery will not write calendar events." : "Try different search or filter options."}</p></div>}</div>
       <div className="table-footer"><span>{filtered.length ? `Showing ${pageIndex * pageSize + 1}–${Math.min((pageIndex + 1) * pageSize, filtered.length)} of ${filtered.length} matching people` : `0 of ${people.length} people`}</span><div><button onClick={() => { setPage(Math.max(0, pageIndex - 1)); setSelected(new Set()); }} disabled={pageIndex === 0}>Previous</button><span>Page {pageIndex + 1} of {pageCount}</span><button onClick={() => { setPage(Math.min(pageCount - 1, pageIndex + 1)); setSelected(new Set()); }} disabled={pageIndex >= pageCount - 1}>Next</button></div></div>
     </section>
   </>;
@@ -954,7 +995,7 @@ function RunsPage({ runs, selectedRun, setSelectedRun, runNow, syncRunning, canO
     <div>
       <section className="panel runs-panel"><div className="people-tools"><div><h2>Run history</h2><p>All scheduled and manual sync attempts</p></div><select value={status} onChange={e => setStatus(e.target.value)} aria-label="Filter run status"><option>All statuses</option><option>Succeeded</option><option>Warning</option><option>Failed</option></select>{canOperate && <button className="button secondary" onClick={() => void runNow()} disabled={syncRunning}>{syncRunning ? "Starting…" : "Run diagnostic sync"}</button>}</div><div className="table-wrap"><table><thead><tr><th>Run</th><th>Started</th><th>Status</th><th>Synced</th><th>Changes</th><th>Duration</th><th><span className="sr-only">Open</span></th></tr></thead><tbody>{filtered.map(run => <RunRow key={run.id} run={run} onClick={() => setSelectedRun(run)} />)}{filtered.length === 0 && <tr><td colSpan={7} className="table-empty">{loadError ? "Run history could not be loaded." : "No matching runs. Start a sync when setup is complete."}</td></tr>}</tbody></table></div></section>
     </div>
-    {selectedRun && <aside className="run-drawer"><div className="drawer-head"><div><p className="eyebrow">Run detail</p><h2>{selectedRun.id}</h2></div><button onClick={() => setSelectedRun(null)} aria-label="Close run details">×</button></div><StatusPill status={selectedRun.status} /><div className="drawer-summary"><span><small>Started</small><b>{selectedRun.started}</b></span><span><small>Duration</small><b>{selectedRun.duration}</b></span><span><small>Trigger</small><b>{selectedRun.trigger}</b></span><span><small>People synced</small><b>{selectedRun.users}</b></span></div><h3>Run narrative</h3><p>{selectedRun.note}</p><div className="event-stats"><div><span className="stat-mark green">+</span><b>{selectedRun.created ?? 0}</b><small>Created</small></div><div><span className="stat-mark navy">↻</span><b>{selectedRun.updated ?? 0}</b><small>Updated</small></div><div><span className="stat-mark red">−</span><b>{selectedRun.deleted ?? 0}</b><small>Removed</small></div></div><h3>Timeline</h3><ol className="run-timeline"><li className="done"><span>✓</span><div><b>Users discovered</b><small>{selectedRun.usersDiscovered} directory identities loaded</small></div></li><li className="done"><span>✓</span><div><b>Identity matches</b><small>{selectedRun.usersMatched} Schoolbox identities matched; {selectedRun.users} enabled calendars processed</small></div></li><li className={selectedRun.status === "Failed" ? "failed" : "done"}><span>{selectedRun.status === "Failed" ? "!" : "✓"}</span><div><b>Google calendars updated</b><small>{selectedRun.status === "Failed" ? "Stopped after an API error" : `${selectedRun.errors ?? 0} user errors recorded`}</small></div></li></ol>{canOperate && selectedRun.status !== "Succeeded" && <button className="button primary full" onClick={() => void runNow()}>Retry enabled-user sync <span>→</span></button>}<button className="button ghost full" onClick={() => downloadRun(selectedRun)}>Download run summary</button></aside>}
+    {selectedRun && <aside className="run-drawer"><div className="drawer-head"><div><p className="eyebrow">Run detail</p><h2>{selectedRun.id}</h2></div><button onClick={() => setSelectedRun(null)} aria-label="Close run details">×</button></div><StatusPill status={selectedRun.status} /><div className="drawer-summary"><span><small>Started</small><b>{selectedRun.started}</b></span><span><small>Duration</small><b>{selectedRun.duration}</b></span><span><small>Trigger</small><b>{selectedRun.trigger}</b></span><span><small>People synced</small><b>{selectedRun.users}</b></span><span><small>Current phase</small><b>{selectedRun.phase.replaceAll("_", " ")}</b></span><span><small>Last progress</small><b>{selectedRun.progressAt ? new Date(selectedRun.progressAt).toLocaleTimeString("en-AU") : "Not recorded"}</b></span></div><h3>{selectedRun.status === "Running" ? "Current operation" : "Run narrative"}</h3><p>{selectedRun.status === "Running" ? selectedRun.phaseDetail : selectedRun.note}</p><div className="event-stats"><div><span className="stat-mark green">+</span><b>{selectedRun.created ?? 0}</b><small>Created</small></div><div><span className="stat-mark navy">↻</span><b>{selectedRun.updated ?? 0}</b><small>Updated</small></div><div><span className="stat-mark red">−</span><b>{selectedRun.deleted ?? 0}</b><small>Removed</small></div></div><h3>Timeline</h3><ol className="run-timeline"><li className={selectedRun.usersDiscovered > 0 ? "done" : ""}><span>{selectedRun.usersDiscovered > 0 ? "✓" : "…"}</span><div><b>Users discovered</b><small>{selectedRun.usersDiscovered} directory identities loaded</small></div></li><li className={selectedRun.usersMatched > 0 ? "done" : ""}><span>{selectedRun.usersMatched > 0 ? "✓" : "…"}</span><div><b>Identity matches</b><small>{selectedRun.usersMatched} Schoolbox identities matched; {selectedRun.users} enabled calendars processed</small></div></li><li className={selectedRun.status === "Failed" ? "failed" : selectedRun.status === "Running" ? "" : "done"}><span>{selectedRun.status === "Failed" ? "!" : selectedRun.status === "Running" ? "…" : "✓"}</span><div><b>Google calendars updated</b><small>{selectedRun.status === "Failed" ? "Stopped after an API error" : selectedRun.status === "Running" ? selectedRun.phaseDetail : `${selectedRun.errors ?? 0} user errors recorded`}</small></div></li></ol>{canOperate && selectedRun.status !== "Succeeded" && selectedRun.status !== "Running" && <button className="button primary full" onClick={() => void runNow()}>Retry enabled-user sync <span>→</span></button>}<button className="button ghost full" onClick={() => downloadRun(selectedRun)}>Download run summary</button></aside>}
   </div>;
 }
 
@@ -968,12 +1009,17 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
   const [section, setSection] = useState("Schedule");
   const [testing, setTesting] = useState<"schoolbox" | "google" | null>(null);
   const [eventTypes, setEventTypes] = useState<DiscoveredEventType[]>([]);
+  const [calendarUsage, setCalendarUsage] = useState<CalendarDestinationUsage[]>([]);
+  const [retiringCalendar, setRetiringCalendar] = useState<string | null>(null);
   const [typeRuleText, setTypeRuleText] = useState(() => config.syncPolicy.eventTypes.join("\n"));
 
   useEffect(() => {
     let cancelled = false;
     void fetchJson("/api/event-types").then((payload) => {
       if (!cancelled) setEventTypes((payload.eventTypes as DiscoveredEventType[] | undefined) ?? []);
+    }).catch(() => undefined);
+    void fetchJson("/api/calendar-destinations").then((payload) => {
+      if (!cancelled) setCalendarUsage((payload.destinations as CalendarDestinationUsage[] | undefined) ?? []);
     }).catch(() => undefined);
     return () => { cancelled = true; };
   }, []);
@@ -1024,27 +1070,44 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
   };
   const removeCalendar = (id: string) => {
     const definition = config.syncPolicy.secondaryCalendars.find(calendar => calendar.id === id);
-    if (!definition || !window.confirm(`Remove the destination “${definition.name}” from Relay settings? The Google calendar itself will not be deleted.`)) return;
-    setConfig(current => {
-      const stripDestination = (rule: GoogleEventRuleOverride) => {
-        const next = { ...rule };
-        if (next.destinationId === id) delete next.destinationId;
-        return next;
-      };
-      const categoryOverrides = Object.fromEntries(Object.entries(current.syncPolicy.categoryOverrides)
-        .map(([key, rule]) => [key, stripDestination(rule ?? {})])
-        .filter(([, rule]) => Object.keys(rule as GoogleEventRuleOverride).length));
-      const eventTypeOverrides = Object.fromEntries(Object.entries(current.syncPolicy.eventTypeOverrides)
-        .map(([key, rule]) => [key, stripDestination(rule)])
-        .filter(([, rule]) => Object.keys(rule as GoogleEventRuleOverride).length));
-      return { ...current, syncPolicy: normalizeSyncPolicy({
-        ...current.syncPolicy,
-        defaultDestinationId: current.syncPolicy.defaultDestinationId === id ? "primary" : current.syncPolicy.defaultDestinationId,
-        secondaryCalendars: current.syncPolicy.secondaryCalendars.filter(calendar => calendar.id !== id),
-        categoryOverrides,
-        eventTypeOverrides,
-      }, current.syncPolicy) };
-    });
+    if (!definition || !window.confirm(`Remove the destination “${definition.name}” from Relay routing? Existing Google calendars will remain and appear below for separate cleanup.`)) return;
+    setConfig(current => ({
+      ...current,
+      syncPolicy: withoutManagedCalendarDestination(current.syncPolicy, id),
+    }));
+  };
+  const retireCalendar = async (id: string, name: string, calendarCount: number) => {
+    if (retiringCalendar) return;
+    const confirmed = window.confirm(
+      `Retire “${name}” and permanently delete ${calendarCount} tracked Google secondary calendar(s)? All content in those calendars, including manually added events, will be deleted. Relay will also remove this destination from saved routing. This cannot be undone.`,
+    );
+    if (!confirmed) return;
+    setRetiringCalendar(id);
+    try {
+      const payload = await fetchJson("/api/calendar-destinations", {
+        method: "DELETE",
+        body: JSON.stringify({ destinationId: id }),
+      });
+      setConfig(current => ({
+        ...current,
+        syncPolicy: withoutManagedCalendarDestination(current.syncPolicy, id),
+      }));
+      setCalendarUsage((payload.destinations as CalendarDestinationUsage[] | undefined) ?? []);
+      const deleted = Number(payload.calendarsDeleted ?? 0);
+      const alreadyMissing = Number(payload.calendarsAlreadyMissing ?? 0);
+      const remaining = Number(payload.calendarsRemaining ?? 0);
+      const removedEvents = Number(payload.eventMappingsRemoved ?? 0);
+      if (remaining > 0 || payload.error) {
+        setNotice({ kind: "error", message: `Destination routing was retired and ${deleted} calendar(s) deleted, but ${remaining} tracked calendar(s) still need cleanup. Retry from the retired destinations list after checking Google access.` });
+      } else {
+        const missingNote = alreadyMissing > 0 ? ` ${alreadyMissing} calendar(s) were already absent.` : "";
+        setNotice({ kind: "success", message: `Destination retired and ${deleted} Google calendar(s) deleted. ${removedEvents} tracked event mapping(s) removed.${missingNote}` });
+      }
+    } catch (error) {
+      setNotice({ kind: "error", message: error instanceof Error ? error.message : "The calendar destination could not be retired." });
+    } finally {
+      setRetiringCalendar(null);
+    }
   };
   const testConnection = async (target: "schoolbox" | "google") => {
     setTesting(target);
@@ -1102,6 +1165,9 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
     if (config.syncPolicy.eventTypeMode === "include") return listed ? "Included by filter" : "Excluded by filter";
     return listed ? "Excluded by filter" : "Included by filter";
   };
+  const configuredDestinationIds = new Set(config.syncPolicy.secondaryCalendars.map(calendar => calendar.id));
+  const usageForDestination = (id: string) => calendarUsage.find(usage => usage.destinationId === id);
+  const retiredCalendarUsage = calendarUsage.filter(usage => !configuredDestinationIds.has(usage.destinationId));
 
   return <div className="settings-layout">
     <aside className="settings-nav">{sections.map(item => <button type="button" key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item}<span>→</span></button>)}</aside>
@@ -1130,9 +1196,17 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
         <div className="policy-grid three"><PolicyToggle checked={config.syncPolicy.includeTimedEvents} onChange={enabled => setPolicy({ includeTimedEvents: enabled })} title="Timed events" detail="Events with start and end times." /><PolicyToggle checked={config.syncPolicy.includeAllDayEvents} onChange={enabled => setPolicy({ includeAllDayEvents: enabled })} title="All-day events" detail="Events represented by dates rather than times." /><PolicyToggle checked={config.syncPolicy.includeCompletedEvents} onChange={enabled => setPolicy({ includeCompletedEvents: enabled })} title="Completed items" detail="Task-like items marked completed in Schoolbox." /></div>
 
         <h3 className="settings-subhead">Calendar destinations</h3>
-        <div className="settings-note"><span>G</span><div><b>Primary calendar is always available</b><small>Secondary calendars are created lazily. Name, description, and time-zone changes are applied to existing calendars on each enabled user&apos;s next sync.</small></div></div>
-        <div className="calendar-definitions">{config.syncPolicy.secondaryCalendars.map(calendar => <div className="calendar-definition" key={calendar.id}><div className="calendar-definition-head"><div><b>{calendar.name || "Unnamed destination"}</b><small>Relay destination ID: {calendar.id}</small></div><button type="button" className="row-delete" onClick={() => removeCalendar(calendar.id)}>Remove</button></div><div className="form-grid two"><Field label="Calendar name"><input required maxLength={100} value={calendar.name} onChange={e => updateCalendar(calendar.id, { name: e.target.value })} placeholder="Choose a name users will recognise" /></Field><Field label="Description"><input maxLength={500} value={calendar.description} onChange={e => updateCalendar(calendar.id, { description: e.target.value })} placeholder="Optional description" /></Field></div></div>)}</div>
+        <div className="settings-note"><span>G</span><div><b>Primary calendar is always protected</b><small>Secondary calendars are created lazily. Remove routing leaves existing calendars in place; retire and delete permanently removes every tracked copy and all content inside it.</small></div></div>
+        <div className="calendar-definitions">{config.syncPolicy.secondaryCalendars.map(calendar => {
+          const usage = usageForDestination(calendar.id);
+          const calendarCount = usage?.calendarCount ?? 0;
+          return <div className="calendar-definition" key={calendar.id}>
+            <div className="calendar-definition-head"><div><b>{calendar.name || "Unnamed destination"}</b><small>Relay destination ID: {calendar.id}</small><small className="calendar-usage">{calendarCount} tracked user calendar(s) · {usage?.eventCount ?? 0} managed event(s)</small></div><div className="calendar-definition-actions"><button type="button" className="row-delete" onClick={() => removeCalendar(calendar.id)} disabled={retiringCalendar !== null}>Remove routing</button>{calendarCount > 0 && <button type="button" className="row-delete destructive" onClick={() => void retireCalendar(calendar.id, calendar.name || calendar.id, calendarCount)} disabled={retiringCalendar !== null}>{retiringCalendar === calendar.id ? "Retiring…" : "Retire & delete"}</button>}</div></div>
+            <div className="form-grid two"><Field label="Calendar name"><input required maxLength={100} value={calendar.name} onChange={e => updateCalendar(calendar.id, { name: e.target.value })} placeholder="Choose a name users will recognise" /></Field><Field label="Description"><input maxLength={500} value={calendar.description} onChange={e => updateCalendar(calendar.id, { description: e.target.value })} placeholder="Optional description" /></Field></div>
+          </div>;
+        })}</div>
         <button type="button" className="button secondary add-destination" onClick={addCalendar} disabled={config.syncPolicy.secondaryCalendars.length >= 20}>+ Add secondary calendar destination</button>
+        {retiredCalendarUsage.length > 0 && <div className="retired-calendar-list"><h4>Retired destinations awaiting cleanup</h4><p>These destinations are no longer routed but still have tracked Google calendars. Retry deletion after resolving any Google access problem.</p>{retiredCalendarUsage.map(usage => <div className="retired-calendar" key={usage.destinationId}><div><b>{usage.summary || usage.destinationId}</b><small>{usage.calendarCount} tracked user calendar(s) · {usage.eventCount} managed event(s)</small><small>Relay destination ID: {usage.destinationId}</small></div><button type="button" className="button danger" onClick={() => void retireCalendar(usage.destinationId, usage.summary || usage.destinationId, usage.calendarCount)} disabled={retiringCalendar !== null}>{retiringCalendar === usage.destinationId ? "Deleting…" : "Delete remaining calendars"}</button></div>)}</div>}
 
         <h3 className="settings-subhead">Default Google behaviour</h3>
         <p className="settings-section-copy">This is the fallback for every included event. Category and exact-type cards below show their effective destination and availability.</p>
@@ -1180,7 +1254,13 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
       {section === "Advanced" && <SettingsSection title="Advanced operations" intro="Control scheduler state and how much parallel work Relay sends to the APIs.">
         <PolicyToggle checked={config.enabled} onChange={enabled => setConfig(c => ({ ...c, enabled }))} title="Scheduled synchronization enabled" detail={config.enabled ? "The local scheduler starts runs at the configured interval." : "Scheduled runs are paused; manual runs remain available to operators."} />
         <Field label="Concurrent user calendars" hint="Lower this if either API begins throttling; range 1–10."><input type="number" min={1} max={10} value={config.concurrency} onChange={e => setConfig(c => ({ ...c, concurrency: e.target.value }))} /></Field>
-        <div className="callout"><span>✓</span><div><b>Built-in safeguards remain active</b><p>API retries use exponential backoff, requests are month-chunked, and only Relay-managed event IDs are updated or deleted.</p></div></div>
+        <h3 className="settings-subhead">Failure limits</h3>
+        <div className="form-grid">
+          <Field label="Initial discovery timeout" hint="Maximum time for Schoolbox and Google user discovery; range 30–900 seconds."><input type="number" min={30} max={900} value={config.discoveryTimeoutSeconds} onChange={e => setConfig(c => ({ ...c, discoveryTimeoutSeconds: e.target.value }))} /></Field>
+          <Field label="Per-user sync timeout" hint="Maximum time for one enabled user; range 30–1800 seconds."><input type="number" min={30} max={1800} value={config.userSyncTimeoutSeconds} onChange={e => setConfig(c => ({ ...c, userSyncTimeoutSeconds: e.target.value }))} /></Field>
+          <Field label="Whole-run timeout" hint="Hard limit for an organization run; range 5–240 minutes."><input type="number" min={5} max={240} value={config.runTimeoutMinutes} onChange={e => setConfig(c => ({ ...c, runTimeoutMinutes: e.target.value }))} /></Field>
+        </div>
+        <div className="callout"><span>✓</span><div><b>Stalled calls are aborted</b><p>API retries use exponential backoff, initial discovery and each user have deadlines, and the whole-run limit prevents a live heartbeat from masking a job that is making no progress.</p></div></div>
       </SettingsSection>}
 
       <div className="settings-actions"><span>Changes take effect on the next sync. Saving does not start a run.</span><button className="button primary" type="submit">Save all settings</button></div>

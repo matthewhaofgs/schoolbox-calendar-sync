@@ -89,6 +89,12 @@ export interface ListGoogleUsersOptions {
   query?: string;
   includeSuspended?: boolean;
   signal?: AbortSignal;
+  onPage?: (progress: {
+    pageNumber: number;
+    pageItems: number;
+    accumulatedItems: number;
+    hasNextPage: boolean;
+  }) => void | Promise<void>;
 }
 
 export interface GoogleCalendarEventDateTime {
@@ -306,6 +312,25 @@ export class GoogleConfigurationError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Google request was aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => reject(signal.reason ?? new Error("Google request was aborted"));
+    signal.addEventListener("abort", aborted, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", aborted);
+        reject(error);
+      },
+    );
+  });
 }
 
 function requiredString(
@@ -797,6 +822,7 @@ export class GoogleWorkspaceClient {
   private async exchangeAccessToken(
     subject: string,
     scopes: readonly string[],
+    signal?: AbortSignal | null,
   ): Promise<GoogleAccessToken> {
     const normalizedSubject = normalizeSubject(subject);
     const normalizedScopes = normalizeScopes(scopes);
@@ -816,6 +842,7 @@ export class GoogleWorkspaceClient {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: form.toString(),
+      signal,
     });
     const body = (await readResponseBody(response)) as GoogleOAuthTokenResponse;
     if (!response.ok) throwGoogleApiError(response, body, "POST");
@@ -854,7 +881,9 @@ export class GoogleWorkspaceClient {
   async getAccessTokenInfo(
     subject: string,
     scopes: readonly string[] = GOOGLE_WORKSPACE_SCOPES,
+    signal?: AbortSignal | null,
   ): Promise<GoogleAccessToken> {
+    if (signal?.aborted) throw signal.reason ?? new Error("Google token request was aborted");
     const key = this.tokenKey(subject, scopes);
     const cached = this.tokenCache.get(key);
     if (
@@ -865,9 +894,9 @@ export class GoogleWorkspaceClient {
     }
 
     const pending = this.pendingTokens.get(key);
-    if (pending) return pending;
+    if (pending) return abortable(pending, signal);
 
-    const exchange = this.exchangeAccessToken(subject, scopes)
+    const exchange = this.exchangeAccessToken(subject, scopes, signal)
       .then((token) => {
         this.tokenCache.set(key, token);
         return token;
@@ -876,14 +905,15 @@ export class GoogleWorkspaceClient {
         this.pendingTokens.delete(key);
       });
     this.pendingTokens.set(key, exchange);
-    return exchange;
+    return abortable(exchange, signal);
   }
 
   async getAccessToken(
     subject: string,
     scopes: readonly string[] = GOOGLE_WORKSPACE_SCOPES,
+    signal?: AbortSignal | null,
   ): Promise<string> {
-    return (await this.getAccessTokenInfo(subject, scopes)).accessToken;
+    return (await this.getAccessTokenInfo(subject, scopes, signal)).accessToken;
   }
 
   clearTokenCache(subject?: string): void {
@@ -910,7 +940,7 @@ export class GoogleWorkspaceClient {
       if (forceRefresh) {
         this.tokenCache.delete(this.tokenKey(subject, scopes));
       }
-      const token = await this.getAccessToken(subject, scopes);
+      const token = await this.getAccessToken(subject, scopes, init.signal);
       const headers = new Headers(init.headers);
       headers.set("authorization", `Bearer ${token}`);
       headers.set("accept", "application/json");
@@ -963,9 +993,11 @@ export class GoogleWorkspaceClient {
     const users: GoogleDirectoryUser[] = [];
     const seenPageTokens = new Set<string>();
     let pageToken: string | undefined;
+    let pageNumber = 0;
 
     do {
       const page = await this.listUsersPage(adminSubject, options, pageToken);
+      pageNumber += 1;
       if (page.users !== undefined && !Array.isArray(page.users)) {
         throw new GoogleApiError(
           "Google Directory returned an invalid users collection.",
@@ -977,6 +1009,12 @@ export class GoogleWorkspaceClient {
       }
 
       pageToken = page.nextPageToken || undefined;
+      await options.onPage?.({
+        pageNumber,
+        pageItems: page.users?.length ?? 0,
+        accumulatedItems: users.length,
+        hasNextPage: Boolean(pageToken),
+      });
       if (pageToken) {
         if (seenPageTokens.has(pageToken)) {
           throw new GoogleApiError(
@@ -1071,6 +1109,24 @@ export class GoogleWorkspaceClient {
         body: JSON.stringify(calendar),
         signal: options.signal,
       },
+    );
+  }
+
+  /** Permanently deletes a Relay-created secondary calendar owned by the delegated user. */
+  async deleteCalendar(
+    userEmail: string,
+    calendarId: string,
+    options: GoogleCalendarManagementOptions = {},
+  ): Promise<void> {
+    const id = calendarId.trim();
+    if (!id || id === "primary") throw new TypeError("A secondary calendar ID is required.");
+    const url = new URL(`${GOOGLE_CALENDAR_API_BASE_URL}/calendars/${encodeURIComponent(id)}`);
+    url.searchParams.set("quotaUser", await this.quotaUser(userEmail, options.quotaUser));
+    await this.authorizedRequest<void>(
+      userEmail,
+      [GOOGLE_CALENDAR_APP_CREATED_SCOPE],
+      url,
+      { method: "DELETE", signal: options.signal },
     );
   }
 
@@ -1231,7 +1287,7 @@ export class GoogleWorkspaceClient {
     });
     // Token issuance validates the delegated app-created scope without creating
     // or changing a user's calendar during a diagnostic.
-    await this.getAccessToken(calendarUser, [GOOGLE_CALENDAR_APP_CREATED_SCOPE]);
+    await this.getAccessToken(calendarUser, [GOOGLE_CALENDAR_APP_CREATED_SCOPE], options.signal);
 
     return {
       ok: true,

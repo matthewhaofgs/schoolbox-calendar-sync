@@ -275,6 +275,35 @@ export function normalizeSyncPolicy(input: unknown, fallback: SyncPolicy = DEFAU
   };
 }
 
+export function withoutManagedCalendarDestination(policy: SyncPolicy, destinationId: string): SyncPolicy {
+  const id = destinationId.trim();
+  if (!id || id === "primary") return normalizeSyncPolicy(policy, policy);
+
+  const categoryOverrides: Partial<Record<EventCategory, GoogleEventRuleOverride>> = {};
+  for (const category of EVENT_CATEGORIES) {
+    const rule = policy.categoryOverrides[category];
+    if (!rule) continue;
+    const next = { ...rule };
+    if (next.destinationId === id) delete next.destinationId;
+    if (Object.keys(next).length > 0) categoryOverrides[category] = next;
+  }
+
+  const eventTypeOverrides: Record<string, GoogleEventRuleOverride> = {};
+  for (const [key, rule] of Object.entries(policy.eventTypeOverrides)) {
+    const next = { ...rule };
+    if (next.destinationId === id) delete next.destinationId;
+    if (Object.keys(next).length > 0) eventTypeOverrides[key] = next;
+  }
+
+  return normalizeSyncPolicy({
+    ...policy,
+    defaultDestinationId: policy.defaultDestinationId === id ? "primary" : policy.defaultDestinationId,
+    secondaryCalendars: policy.secondaryCalendars.filter((calendar) => calendar.id !== id),
+    categoryOverrides,
+    eventTypeOverrides,
+  }, policy);
+}
+
 export type PolicyEvent = {
   category: EventCategory;
   type: string | null;

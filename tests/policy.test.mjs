@@ -6,6 +6,7 @@ import {
   eventIncludedByPolicy,
   normalizeSyncPolicy,
   resolveGoogleEventRule,
+  withoutManagedCalendarDestination,
 } from "../lib/policy.ts";
 import { normalizeSchoolboxCalendarEvent } from "../lib/schoolbox.ts";
 import { eventBody } from "../lib/sync.ts";
@@ -130,4 +131,28 @@ test("exact Google rules override category rules and reusable destinations safel
   assert.equal(exactRule.colorId, "9");
   assert.equal(exactRule.visibility, "private");
   assert.equal(eventIncludedByPolicy({ category: "timetable", type: "SPECIAL LESSON", allDay: false, completed: false }, policy), true);
+});
+
+test("retiring a destination removes only its routing values and preserves other overrides", () => {
+  const policy = normalizeSyncPolicy({
+    defaultDestinationId: "learning",
+    secondaryCalendars: [
+      { id: "learning", name: "Learning", description: "Course calendar" },
+      { id: "events", name: "Events", description: "Public events" },
+    ],
+    categoryOverrides: {
+      timetable: { destinationId: "learning", transparency: "opaque" },
+      school_event: { destinationId: "events", visibility: "public" },
+    },
+    eventTypeOverrides: {
+      lesson: { destinationId: "learning", colorId: "9" },
+    },
+  });
+
+  const retired = withoutManagedCalendarDestination(policy, "learning");
+  assert.equal(retired.defaultDestinationId, "primary");
+  assert.deepEqual(retired.secondaryCalendars.map(calendar => calendar.id), ["events"]);
+  assert.deepEqual(retired.categoryOverrides.timetable, { transparency: "opaque" });
+  assert.deepEqual(retired.categoryOverrides.school_event, { destinationId: "events", visibility: "public" });
+  assert.deepEqual(retired.eventTypeOverrides.lesson, { colorId: "9" });
 });

@@ -21,6 +21,9 @@ export type AppConfig = {
   pastDays: number;
   futureDays: number;
   concurrency: number;
+  discoveryTimeoutSeconds: number;
+  userSyncTimeoutSeconds: number;
+  runTimeoutMinutes: number;
   syncIntervalMinutes: number;
   syncNewUsersByDefault: boolean;
   syncPolicy: SyncPolicy;
@@ -48,6 +51,9 @@ export type RunSummary = {
   id: string;
   trigger: string;
   status: string;
+  phase: string | null;
+  phaseDetail: string | null;
+  progressAt: string | null;
   startedAt: string;
   completedAt: string | null;
   usersDiscovered: number;
@@ -72,6 +78,7 @@ export type UserMapping = {
   lastSyncAt: string | null;
   lastError: string | null;
   eventCount: number;
+  calendarCount: number;
   syncEnabled: boolean;
   directoryActive: boolean;
   updatedAt: string;
@@ -101,6 +108,17 @@ export type UserCalendarTarget = {
   updatedAt: string;
 };
 
+export type UserCalendarTargetWithEmail = UserCalendarTarget & {
+  googleEmail: string;
+};
+
+export type CalendarDestinationUsage = {
+  destinationId: string;
+  summary: string;
+  calendarCount: number;
+  eventCount: number;
+};
+
 const schemaStatements = [
   `CREATE TABLE IF NOT EXISTS app_config (
     id INTEGER PRIMARY KEY DEFAULT 1,
@@ -113,6 +131,9 @@ const schemaStatements = [
     past_days INTEGER NOT NULL DEFAULT 30,
     future_days INTEGER NOT NULL DEFAULT 180,
     concurrency INTEGER NOT NULL DEFAULT 3,
+    discovery_timeout_seconds INTEGER NOT NULL DEFAULT 120,
+    user_sync_timeout_seconds INTEGER NOT NULL DEFAULT 180,
+    run_timeout_minutes INTEGER NOT NULL DEFAULT 30,
     sync_interval_minutes INTEGER NOT NULL DEFAULT 360,
     sync_new_users_by_default INTEGER NOT NULL DEFAULT 0 CHECK (sync_new_users_by_default IN (0, 1)),
     sync_policy_json TEXT NOT NULL DEFAULT '{}',
@@ -124,6 +145,9 @@ const schemaStatements = [
     id TEXT PRIMARY KEY,
     trigger TEXT NOT NULL,
     status TEXT NOT NULL,
+    phase TEXT,
+    phase_detail TEXT,
+    progress_at TEXT,
     started_at TEXT NOT NULL,
     heartbeat_at TEXT,
     completed_at TEXT,
@@ -205,6 +229,15 @@ export async function ensureSchema(): Promise<void> {
   if (!runColumns.some((column) => column.name === "heartbeat_at")) {
     binding.prepare("ALTER TABLE sync_runs ADD COLUMN heartbeat_at TEXT").run();
   }
+  if (!runColumns.some((column) => column.name === "phase")) {
+    binding.prepare("ALTER TABLE sync_runs ADD COLUMN phase TEXT").run();
+  }
+  if (!runColumns.some((column) => column.name === "phase_detail")) {
+    binding.prepare("ALTER TABLE sync_runs ADD COLUMN phase_detail TEXT").run();
+  }
+  if (!runColumns.some((column) => column.name === "progress_at")) {
+    binding.prepare("ALTER TABLE sync_runs ADD COLUMN progress_at TEXT").run();
+  }
   const configColumns = binding.prepare("PRAGMA table_info(app_config)").all<{ name: string }>().results;
   if (!configColumns.some((column) => column.name === "sync_new_users_by_default")) {
     // Legacy installations implicitly synced every newly discovered account. Keep
@@ -215,6 +248,15 @@ export async function ensureSchema(): Promise<void> {
     // Existing installations synchronized every category and copied all content.
     // The policy defaults preserve that behaviour until an administrator changes it.
     binding.prepare("ALTER TABLE app_config ADD COLUMN sync_policy_json TEXT NOT NULL DEFAULT '{}'").run();
+  }
+  if (!configColumns.some((column) => column.name === "discovery_timeout_seconds")) {
+    binding.prepare("ALTER TABLE app_config ADD COLUMN discovery_timeout_seconds INTEGER NOT NULL DEFAULT 120").run();
+  }
+  if (!configColumns.some((column) => column.name === "user_sync_timeout_seconds")) {
+    binding.prepare("ALTER TABLE app_config ADD COLUMN user_sync_timeout_seconds INTEGER NOT NULL DEFAULT 180").run();
+  }
+  if (!configColumns.some((column) => column.name === "run_timeout_minutes")) {
+    binding.prepare("ALTER TABLE app_config ADD COLUMN run_timeout_minutes INTEGER NOT NULL DEFAULT 30").run();
   }
   const eventMappingColumns = binding.prepare("PRAGMA table_info(event_mappings)").all<{ name: string }>().results;
   if (!eventMappingColumns.some((column) => column.name === "calendar_id")) {
@@ -285,6 +327,9 @@ type ConfigRow = {
   past_days: number;
   future_days: number;
   concurrency: number;
+  discovery_timeout_seconds: number;
+  user_sync_timeout_seconds: number;
+  run_timeout_minutes: number;
   sync_interval_minutes: number;
   sync_new_users_by_default: number;
   sync_policy_json: string;
@@ -320,6 +365,9 @@ export async function getConfig(includeSecrets = false): Promise<AppConfig> {
     pastDays: row.past_days,
     futureDays: row.future_days,
     concurrency: row.concurrency,
+    discoveryTimeoutSeconds: row.discovery_timeout_seconds,
+    userSyncTimeoutSeconds: row.user_sync_timeout_seconds,
+    runTimeoutMinutes: row.run_timeout_minutes,
     syncIntervalMinutes: row.sync_interval_minutes,
     syncNewUsersByDefault: Boolean(row.sync_new_users_by_default),
     syncPolicy: (() => {
@@ -433,6 +481,9 @@ export async function saveConfig(input: ConfigInput, actor: string): Promise<App
       past_days = ?,
       future_days = ?,
       concurrency = ?,
+      discovery_timeout_seconds = ?,
+      user_sync_timeout_seconds = ?,
+      run_timeout_minutes = ?,
       sync_interval_minutes = ?,
       sync_new_users_by_default = ?,
       sync_policy_json = ?,
@@ -450,6 +501,9 @@ export async function saveConfig(input: ConfigInput, actor: string): Promise<App
       clampInteger(input.pastDays, current.pastDays, 0, 365),
       clampInteger(input.futureDays, current.futureDays, 1, 730),
       clampInteger(input.concurrency, current.concurrency, 1, 10),
+      clampInteger(input.discoveryTimeoutSeconds, current.discoveryTimeoutSeconds, 30, 900),
+      clampInteger(input.userSyncTimeoutSeconds, current.userSyncTimeoutSeconds, 30, 1800),
+      clampInteger(input.runTimeoutMinutes, current.runTimeoutMinutes, 5, 240),
       clampInteger(input.syncIntervalMinutes, current.syncIntervalMinutes, 15, 1440),
       input.syncNewUsersByDefault === undefined ? Number(current.syncNewUsersByDefault) : Number(input.syncNewUsersByDefault),
       JSON.stringify(syncPolicy),
@@ -505,6 +559,9 @@ export async function createRun(trigger: string): Promise<RunSummary> {
     id: crypto.randomUUID(),
     trigger,
     status: "running",
+    phase: "starting",
+    phaseDetail: "Preparing synchronization clients.",
+    progressAt: new Date().toISOString(),
     startedAt: new Date().toISOString(),
     completedAt: null,
     usersDiscovered: 0,
@@ -524,8 +581,10 @@ export async function createRun(trigger: string): Promise<RunSummary> {
       .first<{ id: string }>();
     if (active) throw new HttpError(409, "A sync is already running", active.id);
     database
-      .prepare("INSERT INTO sync_runs (id, trigger, status, started_at, heartbeat_at) VALUES (?, ?, 'running', ?, ?)")
-      .bind(run.id, run.trigger, run.startedAt, run.startedAt)
+      .prepare(`INSERT INTO sync_runs
+        (id, trigger, status, phase, phase_detail, progress_at, started_at, heartbeat_at)
+        VALUES (?, ?, 'running', ?, ?, ?, ?, ?)`)
+      .bind(run.id, run.trigger, run.phase, run.phaseDetail, run.progressAt, run.startedAt, run.startedAt)
       .run();
   });
   return run;
@@ -537,10 +596,38 @@ export async function touchRunHeartbeat(runId: string): Promise<void> {
     .bind(new Date().toISOString(), runId).run();
 }
 
+export async function checkpointRun(run: RunSummary, phase: string, detail: string): Promise<void> {
+  await ensureSchema();
+  const now = new Date().toISOString();
+  run.phase = phase;
+  run.phaseDetail = detail;
+  run.progressAt = now;
+  db().prepare(`UPDATE sync_runs SET phase = ?, phase_detail = ?, progress_at = ?, heartbeat_at = ?,
+    users_discovered = ?, users_matched = ?, users_synced = ?, events_created = ?, events_updated = ?,
+    events_deleted = ?, events_unchanged = ?, errors = ? WHERE id = ? AND status = 'running'`)
+    .bind(
+      phase,
+      detail.slice(0, 2_000),
+      now,
+      now,
+      run.usersDiscovered,
+      run.usersMatched,
+      run.usersSynced,
+      run.eventsCreated,
+      run.eventsUpdated,
+      run.eventsDeleted,
+      run.eventsUnchanged,
+      run.errors,
+      run.id,
+    )
+    .run();
+}
+
 export async function recoverStaleRuns(maxAgeMinutes = 5): Promise<number> {
   await ensureSchema();
   const result = db()
-    .prepare(`UPDATE sync_runs SET status = 'failed', completed_at = ?, errors = errors + 1,
+    .prepare(`UPDATE sync_runs SET status = 'failed', phase = 'failed',
+      phase_detail = 'Run heartbeat stopped before completion.', completed_at = ?, errors = errors + 1,
       message = 'Run was interrupted by a server restart or exceeded the maximum runtime.'
       WHERE status = 'running' AND COALESCE(heartbeat_at, started_at) <= ?`)
     .bind(
@@ -553,12 +640,19 @@ export async function recoverStaleRuns(maxAgeMinutes = 5): Promise<number> {
 
 export async function finishRun(run: RunSummary): Promise<void> {
   await ensureSchema();
+  run.phase = run.status === "completed" || run.status === "completed_with_errors" ? "completed" : "failed";
+  run.phaseDetail = run.message;
+  run.progressAt = run.completedAt;
   await db()
-    .prepare(`UPDATE sync_runs SET status = ?, completed_at = ?, heartbeat_at = ?, users_discovered = ?, users_matched = ?,
+    .prepare(`UPDATE sync_runs SET status = ?, phase = ?, phase_detail = ?, progress_at = ?,
+      completed_at = ?, heartbeat_at = ?, users_discovered = ?, users_matched = ?,
       users_synced = ?, events_created = ?, events_updated = ?, events_deleted = ?, events_unchanged = ?,
       errors = ?, message = ? WHERE id = ?`)
     .bind(
       run.status,
+      run.phase,
+      run.phaseDetail,
+      run.progressAt,
       run.completedAt,
       run.completedAt,
       run.usersDiscovered,
@@ -579,6 +673,7 @@ export async function listRuns(limit = 30): Promise<RunSummary[]> {
   await ensureSchema();
   const result = await db()
     .prepare(`SELECT id, trigger, status, started_at AS startedAt, completed_at AS completedAt,
+      phase, phase_detail AS phaseDetail, progress_at AS progressAt,
       users_discovered AS usersDiscovered, users_matched AS usersMatched, users_synced AS usersSynced,
       events_created AS eventsCreated, events_updated AS eventsUpdated, events_deleted AS eventsDeleted,
       events_unchanged AS eventsUnchanged, errors, message FROM sync_runs ORDER BY started_at DESC LIMIT ?`)
@@ -587,7 +682,7 @@ export async function listRuns(limit = 30): Promise<RunSummary[]> {
   return result.results;
 }
 
-type UserMappingWrite = Omit<UserMapping, "syncEnabled" | "directoryActive">;
+type UserMappingWrite = Omit<UserMapping, "syncEnabled" | "directoryActive" | "calendarCount">;
 
 export async function upsertUserMapping(mapping: UserMappingWrite): Promise<void> {
   await ensureSchema();
@@ -714,6 +809,7 @@ export async function listUserMappings(limit?: number, includeInactive = false):
       u.schoolbox_email AS schoolboxEmail, u.display_name AS displayName, u.role, u.status, u.last_sync_at AS lastSyncAt,
       u.last_error AS lastError,
       (SELECT COUNT(*) FROM event_mappings e WHERE e.google_user_id = u.google_user_id) AS eventCount,
+      (SELECT COUNT(*) FROM user_calendar_targets c WHERE c.google_user_id = u.google_user_id) AS calendarCount,
       u.sync_enabled AS syncEnabled, u.directory_active AS directoryActive, u.updated_at AS updatedAt
       FROM user_mappings u${includeInactive ? "" : " WHERE u.directory_active = 1"}
       ORDER BY u.google_email${limit === undefined ? "" : " LIMIT ?"}`);
@@ -734,6 +830,7 @@ export async function getUserMapping(googleUserId: string): Promise<UserMapping 
       u.schoolbox_email AS schoolboxEmail, u.display_name AS displayName, u.role, u.status, u.last_sync_at AS lastSyncAt,
       u.last_error AS lastError,
       (SELECT COUNT(*) FROM event_mappings e WHERE e.google_user_id = u.google_user_id) AS eventCount,
+      (SELECT COUNT(*) FROM user_calendar_targets c WHERE c.google_user_id = u.google_user_id) AS calendarCount,
       u.sync_enabled AS syncEnabled, u.directory_active AS directoryActive, u.updated_at AS updatedAt
       FROM user_mappings u WHERE u.google_user_id = ? AND u.directory_active = 1`)
     .bind(googleUserId)
@@ -803,6 +900,51 @@ export async function listUserCalendarTargets(googleUserId: string): Promise<Use
     .all<UserCalendarTarget>().results;
 }
 
+export async function listCalendarDestinationUsage(): Promise<CalendarDestinationUsage[]> {
+  await ensureSchema();
+  return db().prepare(`SELECT t.destination_id AS destinationId, MAX(t.summary) AS summary,
+    COUNT(DISTINCT t.google_user_id) AS calendarCount, COUNT(e.source_key) AS eventCount
+    FROM user_calendar_targets t
+    LEFT JOIN event_mappings e ON e.google_user_id = t.google_user_id AND e.calendar_id = t.google_calendar_id
+    GROUP BY t.destination_id ORDER BY MAX(t.summary) COLLATE NOCASE`)
+    .all<CalendarDestinationUsage>().results;
+}
+
+export async function listCalendarTargetsForDestination(destinationId: string): Promise<UserCalendarTargetWithEmail[]> {
+  await ensureSchema();
+  return db().prepare(`SELECT t.google_user_id AS googleUserId, u.google_email AS googleEmail,
+    t.destination_id AS destinationId, t.google_calendar_id AS googleCalendarId,
+    t.summary, t.description, t.time_zone AS timeZone, t.created_at AS createdAt, t.updated_at AS updatedAt
+    FROM user_calendar_targets t
+    JOIN user_mappings u ON u.google_user_id = t.google_user_id
+    WHERE t.destination_id = ? ORDER BY u.google_email COLLATE NOCASE`)
+    .bind(destinationId)
+    .all<UserCalendarTargetWithEmail>().results;
+}
+
+export async function deleteCalendarTargetRecords(
+  googleUserId: string,
+  destinationId: string,
+  googleCalendarId: string,
+): Promise<number> {
+  await ensureSchema();
+  const binding = db();
+  return binding.transaction(() => {
+    const target = binding.prepare(`SELECT 1 AS found FROM user_calendar_targets
+      WHERE google_user_id = ? AND destination_id = ? AND google_calendar_id = ?`)
+      .bind(googleUserId, destinationId, googleCalendarId)
+      .first<{ found: number }>();
+    if (!target) return 0;
+    const removedEvents = Number(binding.prepare(`DELETE FROM event_mappings
+      WHERE google_user_id = ? AND calendar_id = ?`)
+      .bind(googleUserId, googleCalendarId).run().changes);
+    binding.prepare(`DELETE FROM user_calendar_targets
+      WHERE google_user_id = ? AND destination_id = ? AND google_calendar_id = ?`)
+      .bind(googleUserId, destinationId, googleCalendarId).run();
+    return removedEvents;
+  });
+}
+
 export async function upsertUserCalendarTarget(target: UserCalendarTarget): Promise<void> {
   await ensureSchema();
   await db().prepare(`INSERT INTO user_calendar_targets
@@ -842,6 +984,9 @@ export async function recordManagedEventCleanup(options: {
   remaining: number;
   deleted: number;
   alreadyMissing: number;
+  calendarsDeleted?: number;
+  calendarsAlreadyMissing?: number;
+  calendarsRemaining?: number;
   error: string | null;
   actor: string;
 }): Promise<void> {
@@ -863,7 +1008,7 @@ export async function recordManagedEventCleanup(options: {
       .bind(
         now,
         options.actor,
-        `${options.deleted} managed event(s) deleted, ${options.alreadyMissing} already absent, ${options.remaining} remaining`,
+        `${options.deleted} managed event(s) deleted, ${options.alreadyMissing} already absent, ${options.remaining} remaining; ${options.calendarsDeleted ?? 0} managed calendar(s) deleted, ${options.calendarsAlreadyMissing ?? 0} already absent, ${options.calendarsRemaining ?? 0} remaining`,
       )
       .run();
   });

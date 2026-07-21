@@ -196,6 +196,13 @@ export interface SchoolboxUsersPageOptions {
 export interface SchoolboxGetAllUsersOptions {
   pageLimit?: number;
   signal?: AbortSignal;
+  onPage?: (progress: {
+    pageNumber: number;
+    pageItems: number;
+    accumulatedItems: number;
+    totalItems: number | null;
+    hasNextPage: boolean;
+  }) => void | Promise<void>;
 }
 
 export type SchoolboxDateInput = Date | string | number;
@@ -880,6 +887,15 @@ export class SchoolboxClient {
       });
       users.push(...page.data);
 
+      const nextCursor = page.metadata.cursor?.next ?? undefined;
+      await options.onPage?.({
+        pageNumber: pageNumber + 1,
+        pageItems: page.data.length,
+        accumulatedItems: users.length,
+        totalItems: page.metadata.count ?? null,
+        hasNextPage: Boolean(nextCursor),
+      });
+
       // Older Schoolbox installations may always emit a scalar cursor, even
       // on their final non-empty page. The total lets us finish without an
       // unnecessary empty request or a false repeated-cursor error.
@@ -887,7 +903,6 @@ export class SchoolboxClient {
         return users;
       }
 
-      const nextCursor = page.metadata.cursor?.next ?? undefined;
       if (!nextCursor) {
         return users;
       }

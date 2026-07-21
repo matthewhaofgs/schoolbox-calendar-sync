@@ -11,11 +11,14 @@ import { SchoolboxClient, type NormalizedSchoolboxCalendarEvent, type SchoolboxU
 import {
   eventIncludedByPolicy,
   resolveGoogleEventRule,
+  withoutManagedCalendarDestination,
   type SyncPolicy,
 } from "./policy";
 import {
   addAudit,
+  checkpointRun,
   createRun,
+  deleteCalendarTargetRecords,
   deleteEventMapping,
   discoverUserMappings,
   finishRun,
@@ -23,11 +26,13 @@ import {
   getEventMappings,
   getUserCalendarTarget,
   getUserMapping,
+  listCalendarTargetsForDestination,
   listUserCalendarTargets,
   listRuns,
   recordManagedEventCleanup,
   recoverStaleRuns,
   recordDiscoveredEventTypes,
+  saveConfig,
   setUsersSyncEnabled,
   touchRunHeartbeat,
   touchEventMapping,
@@ -42,7 +47,8 @@ import { HttpError } from "./security";
 type MatchedUser = { google: GoogleDirectoryUser; schoolbox: SchoolboxUser; schoolboxEmail: string };
 type SchoolboxSyncClient = Pick<SchoolboxClient, "getAllUsers" | "getCalendarEvents">;
 type GoogleSyncClient = Pick<GoogleWorkspaceClient, "listAllUsers" | "createCalendar" | "updateCalendar" | "insertEvent" | "updateEvent" | "deleteEvent">;
-type GoogleCleanupClient = Pick<GoogleWorkspaceClient, "deleteEvent">;
+type GoogleCleanupClient = Pick<GoogleWorkspaceClient, "deleteEvent"> & Partial<Pick<GoogleWorkspaceClient, "deleteCalendar">>;
+type GoogleCalendarRetirementClient = Pick<GoogleWorkspaceClient, "deleteCalendar">;
 
 /** Optional client overrides used by deterministic integration tests. */
 export type SyncClientOverrides = {
@@ -50,13 +56,108 @@ export type SyncClientOverrides = {
   google?: GoogleSyncClient;
 };
 
+/** Millisecond overrides used only by deterministic timeout tests. */
+export type SyncRuntimeOptions = {
+  discoveryTimeoutMs?: number;
+  userSyncTimeoutMs?: number;
+  runTimeoutMs?: number;
+};
+
 export type ManagedEventCleanupResult = {
   paused: true;
   deleted: number;
   alreadyMissing: number;
   remaining: number;
+  calendarsDeleted: number;
+  calendarsAlreadyMissing: number;
+  calendarsRemaining: number;
   error: string | null;
 };
+
+export type CalendarDestinationRetirementResult = {
+  destinationId: string;
+  calendarsDeleted: number;
+  calendarsAlreadyMissing: number;
+  calendarsFailed: number;
+  calendarsRemaining: number;
+  eventMappingsRemoved: number;
+  error: string | null;
+};
+
+class SyncTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SyncTimeoutError";
+  }
+}
+
+function durationLabel(milliseconds: number): string {
+  if (milliseconds % 60_000 === 0) {
+    const minutes = milliseconds / 60_000;
+    return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+  }
+  const seconds = Math.max(1, Math.round(milliseconds / 1_000));
+  return `${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+}
+
+function positiveTimeout(override: number | undefined, configured: number): number {
+  return override !== undefined && Number.isFinite(override) && override > 0
+    ? override
+    : configured;
+}
+
+function abortError(signal: AbortSignal, fallback: string): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error(fallback);
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError(signal, "Calendar synchronization was aborted");
+}
+
+function createDeadlineSignal(
+  parent: AbortSignal | undefined,
+  milliseconds: number,
+  message: string,
+): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const forwardParentAbort = () => controller.abort(parent?.reason ?? new Error("Calendar synchronization was aborted"));
+  if (parent?.aborted) forwardParentAbort();
+  else parent?.addEventListener("abort", forwardParentAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(new SyncTimeoutError(message)), milliseconds);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      parent?.removeEventListener("abort", forwardParentAbort);
+    },
+  };
+}
+
+async function withHardDeadline<T>(
+  parent: AbortSignal | undefined,
+  milliseconds: number,
+  message: string,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const deadline = createDeadlineSignal(parent, milliseconds, message);
+  let rejectAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = () => reject(abortError(deadline.signal, message));
+    if (deadline.signal.aborted) rejectAbort();
+    else deadline.signal.addEventListener("abort", rejectAbort, { once: true });
+  });
+  try {
+    return await Promise.race([operation(deadline.signal), aborted]);
+  } finally {
+    if (rejectAbort) deadline.signal.removeEventListener("abort", rejectAbort);
+    deadline.dispose();
+  }
+}
+
+function syncErrorMessage(error: unknown, signal?: AbortSignal): string {
+  if (signal?.aborted) return abortError(signal, "Calendar synchronization was aborted").message;
+  return error instanceof Error ? error.message : "Unknown synchronization error";
+}
 
 function normalizedEmail(value: string | null | undefined): string {
   return (value ?? "").trim().toLowerCase();
@@ -172,10 +273,16 @@ export async function eventBody(
   return body;
 }
 
-async function processInPool<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>): Promise<void> {
+async function processInPool<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
   let index = 0;
   const runners = Array.from({ length: Math.min(Math.max(1, concurrency), Math.max(1, items.length)) }, async () => {
     while (index < items.length) {
+      throwIfAborted(signal);
       const item = items[index];
       index += 1;
       await worker(item);
@@ -191,7 +298,9 @@ async function resolveCalendarId(options: {
   timezone: string;
   policy: SyncPolicy;
   google: GoogleSyncClient;
+  signal?: AbortSignal;
 }): Promise<string> {
+  throwIfAborted(options.signal);
   if (options.destinationId === "primary") return "primary";
   const definition = options.policy.secondaryCalendars.find((calendar) => calendar.id === options.destinationId);
   if (!definition) throw new Error(`Calendar destination ${options.destinationId} is no longer configured.`);
@@ -211,6 +320,7 @@ async function resolveCalendarId(options: {
     ) {
       await options.google.updateCalendar(options.googleEmail, existing.googleCalendarId, expected, {
         quotaUser: options.googleUserId,
+        signal: options.signal,
       });
       await upsertUserCalendarTarget({
         ...existing,
@@ -223,6 +333,7 @@ async function resolveCalendarId(options: {
 
   const created = await options.google.createCalendar(options.googleEmail, expected, {
     quotaUser: options.googleUserId,
+    signal: options.signal,
   });
   const googleCalendarId = created.id?.trim();
   if (!googleCalendarId) throw new Error("Google created a secondary calendar without returning its identifier.");
@@ -244,9 +355,11 @@ async function reconcileExistingCalendarTargets(options: {
   timezone: string;
   policy: SyncPolicy;
   google: GoogleSyncClient;
+  signal?: AbortSignal;
 }): Promise<void> {
   const configured = new Map(options.policy.secondaryCalendars.map((calendar) => [calendar.id, calendar]));
   for (const target of options.targets) {
+    throwIfAborted(options.signal);
     const definition = configured.get(target.destinationId);
     if (!definition) continue;
     const expected = {
@@ -262,6 +375,7 @@ async function reconcileExistingCalendarTargets(options: {
 
     await options.google.updateCalendar(options.googleEmail, target.googleCalendarId, expected, {
       quotaUser: options.googleUserId,
+      signal: options.signal,
     });
     await upsertUserCalendarTarget({
       ...target,
@@ -276,7 +390,7 @@ async function syncUser(
   run: RunSummary,
   schoolbox: SchoolboxSyncClient,
   google: GoogleSyncClient,
-  options: { pastDays: number; futureDays: number; timezone: string; syncPolicy: SyncPolicy },
+  options: { pastDays: number; futureDays: number; timezone: string; syncPolicy: SyncPolicy; signal?: AbortSignal },
 ): Promise<void> {
   const now = new Date();
   const windowStart = new Date(now.getTime() - options.pastDays * 86_400_000);
@@ -299,6 +413,7 @@ async function syncUser(
         pastDays: options.pastDays,
         futureDays: options.futureDays,
         now,
+        signal: options.signal,
       }),
       getEventMappings(googleUserId),
       listUserCalendarTargets(googleUserId),
@@ -310,6 +425,7 @@ async function syncUser(
       timezone: options.timezone,
       policy: options.syncPolicy,
       google,
+      signal: options.signal,
     });
     const existing = new Map(storedMappings.map((mapping) => [mapping.sourceKey, mapping]));
     const seen = new Set<string>();
@@ -328,12 +444,14 @@ async function syncUser(
         timezone: options.timezone,
         policy: options.syncPolicy,
         google,
+        signal: options.signal,
       });
       calendarTargets.set(destinationId, target);
       return target;
     };
 
     for (const event of events) {
+      throwIfAborted(options.signal);
       const sourceKey = `${event.sourceKey}:occurrence:${event.start}`;
       if (seen.has(sourceKey) || excluded.has(sourceKey)) continue;
       if (!eventIncludedByPolicy({
@@ -366,6 +484,7 @@ async function syncUser(
           calendarId,
           quotaUser: googleUserId,
           sendUpdates: "none",
+          signal: options.signal,
         });
         run.eventsUpdated += 1;
       } else {
@@ -375,6 +494,7 @@ async function syncUser(
             calendarId,
             quotaUser: googleUserId,
             sendUpdates: "none",
+            signal: options.signal,
           });
         } catch (error) {
           if (!(error instanceof GoogleApiError) || error.status !== 409) throw error;
@@ -383,6 +503,7 @@ async function syncUser(
             calendarId,
             quotaUser: googleUserId,
             sendUpdates: "none",
+            signal: options.signal,
           });
           createdAt = new Date().toISOString();
         }
@@ -392,6 +513,7 @@ async function syncUser(
               calendarId: mapping.calendarId,
               quotaUser: googleUserId,
               sendUpdates: "none",
+              signal: options.signal,
             });
           } catch (error) {
             if (!(error instanceof GoogleApiError) || (error.status !== 404 && error.status !== 410)) throw error;
@@ -418,6 +540,7 @@ async function syncUser(
     }
 
     for (const mapping of storedMappings) {
+      throwIfAborted(options.signal);
       if (seen.has(mapping.sourceKey)) continue;
       const occurrenceMarker = mapping.sourceKey.lastIndexOf(":occurrence:");
       const mappingRoot = occurrenceMarker >= 0 ? mapping.sourceKey.slice(0, occurrenceMarker) : mapping.sourceKey;
@@ -432,6 +555,7 @@ async function syncUser(
           calendarId: mapping.calendarId,
           quotaUser: googleUserId,
           sendUpdates: "none",
+          signal: options.signal,
         });
       } catch (error) {
         if (!(error instanceof GoogleApiError) || (error.status !== 404 && error.status !== 410)) throw error;
@@ -440,6 +564,7 @@ async function syncUser(
       run.eventsDeleted += 1;
     }
 
+    throwIfAborted(options.signal);
     const managedEventCount = (await getEventMappings(googleUserId)).length;
     await upsertUserMapping({
       ...baseMapping,
@@ -450,7 +575,7 @@ async function syncUser(
     });
     run.usersSynced += 1;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown per-user sync error";
+    const message = syncErrorMessage(error, options.signal);
     await upsertUserMapping({
       ...baseMapping,
       status: "error",
@@ -463,14 +588,17 @@ async function syncUser(
 }
 
 /**
- * Pauses one user and removes only Google events tracked in Relay's own
- * event_mappings table. Unrelated calendar entries are never listed or
- * deleted by this operation.
+ * Pauses one user and removes Google events tracked in Relay's event_mappings
+ * table. When explicitly requested, it then permanently deletes only the
+ * secondary calendars recorded in user_calendar_targets. Deleting a calendar
+ * also deletes any manually added content it contains, so this path never
+ * accepts a primary or untracked calendar ID.
  */
 export async function cleanupUserManagedEvents(
   googleUserId: string,
   actor: string,
   clientOverride?: GoogleCleanupClient,
+  options: { deleteCalendars?: boolean } = {},
 ): Promise<ManagedEventCleanupResult> {
   const userId = googleUserId.trim();
   if (!userId) throw new HttpError(400, "Choose a user to clean up");
@@ -478,28 +606,43 @@ export async function cleanupUserManagedEvents(
   const mapping = await getUserMapping(userId);
   if (!mapping) throw new HttpError(404, "This user is no longer available");
 
-  const storedMappings = await getEventMappings(userId);
-  if (storedMappings.length > 0) await recoverStaleRuns();
-  if (storedMappings.length > 0 && (await listRuns(1))[0]?.status === "running") {
+  const [storedMappings, storedCalendarTargets] = await Promise.all([
+    getEventMappings(userId),
+    listUserCalendarTargets(userId),
+  ]);
+  const deleteCalendars = options.deleteCalendars === true;
+  const hasDestructiveWork = storedMappings.length > 0 || (deleteCalendars && storedCalendarTargets.length > 0);
+  if (hasDestructiveWork) await recoverStaleRuns();
+  if (hasDestructiveWork && (await listRuns(1))[0]?.status === "running") {
     throw new HttpError(
       409,
-      "Wait for the current calendar sync run to finish, then retry cleanup.",
+      "Wait for the current calendar operation to finish, then retry cleanup.",
     );
   }
 
   // Pausing before the first delete prevents future scheduled runs from
   // recreating the events immediately after a successful cleanup.
   await setUsersSyncEnabled([userId], false, actor);
-  if (storedMappings.length === 0) {
+  if (!hasDestructiveWork) {
     await recordManagedEventCleanup({
       googleUserId: userId,
       remaining: 0,
       deleted: 0,
       alreadyMissing: 0,
+      calendarsRemaining: storedCalendarTargets.length,
       error: null,
       actor,
     });
-    return { paused: true, deleted: 0, alreadyMissing: 0, remaining: 0, error: null };
+    return {
+      paused: true,
+      deleted: 0,
+      alreadyMissing: 0,
+      remaining: 0,
+      calendarsDeleted: 0,
+      calendarsAlreadyMissing: 0,
+      calendarsRemaining: storedCalendarTargets.length,
+      error: null,
+    };
   }
 
   let google: GoogleCleanupClient;
@@ -518,6 +661,7 @@ export async function cleanupUserManagedEvents(
       remaining: storedMappings.length,
       deleted: 0,
       alreadyMissing: 0,
+      calendarsRemaining: storedCalendarTargets.length,
       error: message,
       actor,
     });
@@ -546,22 +690,177 @@ export async function cleanupUserManagedEvents(
     await deleteEventMapping(userId, eventMapping.sourceKey);
   }
 
-  const remaining = (await getEventMappings(userId)).length;
+  let remaining = (await getEventMappings(userId)).length;
+  let calendarsDeleted = 0;
+  let calendarsAlreadyMissing = 0;
+  if (deleteCalendars && remaining === 0 && storedCalendarTargets.length > 0) {
+    if (!google.deleteCalendar) {
+      cleanupError = "Google Calendar cleanup does not support deleting secondary calendars";
+    } else {
+      for (const target of storedCalendarTargets) {
+        let removeTargetRecords = false;
+        try {
+          await google.deleteCalendar(mapping.googleEmail, target.googleCalendarId, { quotaUser: userId });
+          calendarsDeleted += 1;
+          removeTargetRecords = true;
+        } catch (error) {
+          if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) {
+            calendarsAlreadyMissing += 1;
+            removeTargetRecords = true;
+          } else {
+            cleanupError = error instanceof Error ? error.message : "Google Calendar cleanup failed";
+          }
+        }
+        if (removeTargetRecords) await deleteCalendarTargetRecords(userId, target.destinationId, target.googleCalendarId);
+      }
+      remaining = (await getEventMappings(userId)).length;
+    }
+  }
+
+  const calendarsRemaining = (await listUserCalendarTargets(userId)).length;
   await recordManagedEventCleanup({
     googleUserId: userId,
     remaining,
     deleted,
     alreadyMissing,
+    calendarsDeleted,
+    calendarsAlreadyMissing,
+    calendarsRemaining,
     error: cleanupError,
     actor,
   });
-  return { paused: true, deleted, alreadyMissing, remaining, error: cleanupError };
+  return {
+    paused: true,
+    deleted,
+    alreadyMissing,
+    remaining,
+    calendarsDeleted,
+    calendarsAlreadyMissing,
+    calendarsRemaining,
+    error: cleanupError,
+  };
+}
+
+/**
+ * Permanently removes one managed secondary-calendar destination from every
+ * tracked user. The destination is removed from policy before Google deletion
+ * starts so a subsequent sync cannot recreate it. Failed target records are
+ * retained and shown as retired cleanup work that an administrator can retry.
+ */
+export async function retireCalendarDestination(
+  destinationId: string,
+  actor: string,
+  clientOverride?: GoogleCalendarRetirementClient,
+): Promise<CalendarDestinationRetirementResult> {
+  const id = destinationId.trim();
+  if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(id)) throw new HttpError(400, "Choose a valid calendar destination");
+  if (id === "primary") throw new HttpError(400, "The primary calendar cannot be deleted");
+
+  const initialConfig = await getConfig(false);
+  const initialTargets = await listCalendarTargetsForDestination(id);
+  if (!initialConfig.syncPolicy.secondaryCalendars.some((calendar) => calendar.id === id) && initialTargets.length === 0) {
+    throw new HttpError(404, "This calendar destination is no longer available");
+  }
+
+  await recoverStaleRuns();
+  const run = await createRun("calendar_retirement");
+  const heartbeat = setInterval(() => {
+    void touchRunHeartbeat(run.id).catch(() => undefined);
+  }, 30_000);
+  const result: CalendarDestinationRetirementResult = {
+    destinationId: id,
+    calendarsDeleted: 0,
+    calendarsAlreadyMissing: 0,
+    calendarsFailed: 0,
+    calendarsRemaining: 0,
+    eventMappingsRemoved: 0,
+    error: null,
+  };
+  let unexpectedError: unknown;
+
+  try {
+    const config = await getConfig(true);
+    const targets = await listCalendarTargetsForDestination(id);
+    run.usersDiscovered = targets.length;
+    run.usersMatched = targets.length;
+    await checkpointRun(run, "calendar_retirement", `${targets.length} tracked user calendar(s) queued for retirement.`);
+
+    let google: GoogleCalendarRetirementClient | null = clientOverride ?? null;
+    if (targets.length > 0 && !google) {
+      if (!config.googleServiceAccountJson) throw new HttpError(409, "Google Workspace is not configured");
+      google = new GoogleWorkspaceClient(parseServiceAccountJson(config.googleServiceAccountJson));
+    }
+
+    if (config.syncPolicy.secondaryCalendars.some((calendar) => calendar.id === id)) {
+      await saveConfig({
+        syncPolicy: withoutManagedCalendarDestination(config.syncPolicy, id),
+      }, actor);
+    }
+
+    const errors: string[] = [];
+    await processInPool(targets, config.concurrency, async (target) => {
+      let removeTargetRecords = false;
+      try {
+        await google!.deleteCalendar(target.googleEmail, target.googleCalendarId, {
+          quotaUser: target.googleUserId,
+        });
+        result.calendarsDeleted += 1;
+        removeTargetRecords = true;
+      } catch (error) {
+        if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) {
+          result.calendarsAlreadyMissing += 1;
+          removeTargetRecords = true;
+        } else {
+          result.calendarsFailed += 1;
+          const message = error instanceof Error ? error.message : "Google Calendar deletion failed";
+          if (!errors.includes(message)) errors.push(message);
+        }
+      }
+      if (removeTargetRecords) {
+        const removed = await deleteCalendarTargetRecords(
+          target.googleUserId,
+          id,
+          target.googleCalendarId,
+        );
+        result.eventMappingsRemoved += removed;
+        run.eventsDeleted += removed;
+        run.usersSynced += 1;
+      }
+      await checkpointRun(
+        run,
+        "calendar_retirement",
+        `${run.usersSynced + result.calendarsFailed} of ${targets.length} tracked user calendar(s) processed.`,
+      );
+    });
+
+    result.calendarsRemaining = (await listCalendarTargetsForDestination(id)).length;
+    result.error = errors.length > 0 ? errors.join("; ").slice(0, 2_000) : null;
+    run.errors = result.calendarsFailed;
+    run.status = result.calendarsFailed > 0 ? "completed_with_errors" : "completed";
+    run.message = result.calendarsFailed > 0
+      ? `Calendar destination ${id} was retired, but ${result.calendarsRemaining} user calendar(s) still require deletion.`
+      : `Calendar destination ${id} was retired and ${result.calendarsDeleted + result.calendarsAlreadyMissing} tracked user calendar(s) were removed.`;
+  } catch (error) {
+    unexpectedError = error;
+    run.status = "failed";
+    run.errors += 1;
+    run.message = error instanceof Error ? error.message : "Calendar destination retirement failed.";
+  } finally {
+    clearInterval(heartbeat);
+    run.completedAt = new Date().toISOString();
+    await finishRun(run);
+    await addAudit(actor, `calendar_destination.${run.status}`, `Run ${run.id}: ${run.message ?? run.status}`);
+  }
+
+  if (unexpectedError) throw unexpectedError;
+  return result;
 }
 
 export async function runFullSync(
   trigger: string,
   actor: string,
   clientOverrides: SyncClientOverrides = {},
+  runtimeOptions: SyncRuntimeOptions = {},
 ): Promise<RunSummary> {
   const config = await getConfig(true);
   if (!config.schoolboxBaseUrl || !config.schoolboxToken) {
@@ -570,71 +869,169 @@ export async function runFullSync(
   if (!config.googleServiceAccountJson || !config.googleAdminEmail) {
     throw new HttpError(409, "Google Workspace is not configured");
   }
+  const schoolboxToken = config.schoolboxToken;
+  const googleServiceAccountJson = config.googleServiceAccountJson;
 
   await recoverStaleRuns();
   const run = await createRun(trigger);
   const heartbeat = setInterval(() => {
     void touchRunHeartbeat(run.id).catch(() => undefined);
   }, 30_000);
+  const discoveryTimeoutMs = positiveTimeout(
+    runtimeOptions.discoveryTimeoutMs,
+    config.discoveryTimeoutSeconds * 1_000,
+  );
+  const userSyncTimeoutMs = positiveTimeout(
+    runtimeOptions.userSyncTimeoutMs,
+    config.userSyncTimeoutSeconds * 1_000,
+  );
+  const runTimeoutMs = positiveTimeout(
+    runtimeOptions.runTimeoutMs,
+    config.runTimeoutMinutes * 60_000,
+  );
 
   try {
-    await addAudit(actor, "sync.started", `Run ${run.id} started by ${trigger}`);
-    const schoolbox = clientOverrides.schoolbox ?? new SchoolboxClient({
-      baseUrl: config.schoolboxBaseUrl,
-      jwt: config.schoolboxToken,
-      pastDays: config.pastDays,
-      futureDays: config.futureDays,
-    });
-    const google = clientOverrides.google
-      ?? new GoogleWorkspaceClient(parseServiceAccountJson(config.googleServiceAccountJson));
-    const [schoolboxUsers, googleUsers] = await Promise.all([
-      schoolbox.getAllUsers(),
-      google.listAllUsers(config.googleAdminEmail, { customer: config.googleCustomer || "my_customer" }),
-    ]);
+    await withHardDeadline(
+      undefined,
+      runTimeoutMs,
+      `Organization synchronization timed out after ${durationLabel(runTimeoutMs)}.`,
+      async (runSignal) => {
+        await addAudit(actor, "sync.started", `Run ${run.id} started by ${trigger}`);
+        const schoolbox = clientOverrides.schoolbox ?? new SchoolboxClient({
+          baseUrl: config.schoolboxBaseUrl,
+          jwt: schoolboxToken,
+          pastDays: config.pastDays,
+          futureDays: config.futureDays,
+        });
+        const google = clientOverrides.google
+          ?? new GoogleWorkspaceClient(parseServiceAccountJson(googleServiceAccountJson));
+        await checkpointRun(run, "discovery", "Waiting for Schoolbox and Google Directory user lists.");
+        const discoveryController = new AbortController();
+        const forwardRunAbort = () => discoveryController.abort(runSignal.reason);
+        if (runSignal.aborted) forwardRunAbort();
+        else runSignal.addEventListener("abort", forwardRunAbort, { once: true });
+        let schoolboxProgress = "not started";
+        let googleProgress = "not started";
+        const reportDiscoveryProgress = () => checkpointRun(
+          run,
+          "discovery",
+          `Schoolbox: ${schoolboxProgress}. Google Directory: ${googleProgress}.`,
+        );
+        const [schoolboxUsers, googleUsers] = await (async () => {
+          try {
+            const schoolboxPromise = withHardDeadline(
+              discoveryController.signal,
+              discoveryTimeoutMs,
+              `Schoolbox user discovery timed out after ${durationLabel(discoveryTimeoutMs)}.`,
+              (signal) => schoolbox.getAllUsers({
+                signal,
+                onPage: async (progress) => {
+                  schoolboxProgress = progress.totalItems === null
+                    ? `page ${progress.pageNumber}, ${progress.accumulatedItems} loaded`
+                    : `page ${progress.pageNumber}, ${progress.accumulatedItems} of ${progress.totalItems} loaded`;
+                  await reportDiscoveryProgress();
+                },
+              }),
+            ).then(async (users) => {
+              schoolboxProgress = "complete";
+              await reportDiscoveryProgress();
+              return users;
+            });
+            const googlePromise = withHardDeadline(
+              discoveryController.signal,
+              discoveryTimeoutMs,
+              `Google Directory user discovery timed out after ${durationLabel(discoveryTimeoutMs)}.`,
+              (signal) => google.listAllUsers(config.googleAdminEmail, {
+                customer: config.googleCustomer || "my_customer",
+                signal,
+                onPage: async (progress) => {
+                  googleProgress = `page ${progress.pageNumber}, ${progress.accumulatedItems} loaded`;
+                  await reportDiscoveryProgress();
+                },
+              }),
+            ).then(async (users) => {
+              googleProgress = "complete";
+              await reportDiscoveryProgress();
+              return users;
+            });
+            return await Promise.all([schoolboxPromise, googlePromise]);
+          } catch (error) {
+            discoveryController.abort(error);
+            throw error;
+          } finally {
+            runSignal.removeEventListener("abort", forwardRunAbort);
+          }
+        })();
 
-    const schoolboxByEmail = indexActiveSchoolboxUsersByEmail(schoolboxUsers);
-    const activeGoogle = googleUsers.filter(isGoogleActive);
-    const matched: MatchedUser[] = [];
-    const discoveredAt = new Date().toISOString();
-    const discoveries = activeGoogle.map((googleUser) => {
-      const googleEmail = normalizedEmail(googleUser.primaryEmail);
-      const schoolboxUser = schoolboxByEmail.get(googleEmail);
-      if (schoolboxUser) matched.push({ google: googleUser, schoolbox: schoolboxUser, schoolboxEmail: googleEmail });
-      return {
-        googleUserId: googleUser.id,
-        googleEmail: googleUser.primaryEmail,
-        schoolboxUserId: schoolboxUser?.id ?? null,
-        schoolboxEmail: schoolboxUser ? googleEmail : null,
-        displayName: googleDisplayName(googleUser) || (schoolboxUser ? schoolboxDisplayName(schoolboxUser) : null),
-        role: schoolboxUser ? schoolboxRole(schoolboxUser) : null,
-        status: schoolboxUser ? "pending" : "unmatched",
-        lastSyncAt: null,
-        lastError: schoolboxUser ? null : "No active Schoolbox user has this primary or alternate email address.",
-        eventCount: 0,
-        updatedAt: discoveredAt,
-      };
-    });
-    run.usersDiscovered = activeGoogle.length;
-    const selection = await discoverUserMappings(discoveries, config.syncNewUsersByDefault);
-    run.usersMatched = matched.length;
-    const selected = matched.filter((match) => selection.get(match.google.id) === true);
-    await processInPool(selected, config.concurrency, (match) =>
-      syncUser(match, run, schoolbox, google, {
-        pastDays: config.pastDays,
-        futureDays: config.futureDays,
-        timezone: config.timezone,
-        syncPolicy: config.syncPolicy,
-      }),
+        await checkpointRun(run, "matching", "Matching active Google and Schoolbox identities.");
+        const schoolboxByEmail = indexActiveSchoolboxUsersByEmail(schoolboxUsers);
+        const activeGoogle = googleUsers.filter(isGoogleActive);
+        const matched: MatchedUser[] = [];
+        const discoveredAt = new Date().toISOString();
+        const discoveries = activeGoogle.map((googleUser) => {
+          const googleEmail = normalizedEmail(googleUser.primaryEmail);
+          const schoolboxUser = schoolboxByEmail.get(googleEmail);
+          if (schoolboxUser) matched.push({ google: googleUser, schoolbox: schoolboxUser, schoolboxEmail: googleEmail });
+          return {
+            googleUserId: googleUser.id,
+            googleEmail: googleUser.primaryEmail,
+            schoolboxUserId: schoolboxUser?.id ?? null,
+            schoolboxEmail: schoolboxUser ? googleEmail : null,
+            displayName: googleDisplayName(googleUser) || (schoolboxUser ? schoolboxDisplayName(schoolboxUser) : null),
+            role: schoolboxUser ? schoolboxRole(schoolboxUser) : null,
+            status: schoolboxUser ? "pending" : "unmatched",
+            lastSyncAt: null,
+            lastError: schoolboxUser ? null : "No active Schoolbox user has this primary or alternate email address.",
+            eventCount: 0,
+            updatedAt: discoveredAt,
+          };
+        });
+        run.usersDiscovered = activeGoogle.length;
+        const selection = await discoverUserMappings(discoveries, config.syncNewUsersByDefault);
+        run.usersMatched = matched.length;
+        const selected = matched.filter((match) => selection.get(match.google.id) === true);
+        await checkpointRun(
+          run,
+          "user_sync",
+          `${selected.length} enabled user calendar(s) queued; ${matched.length - selected.length} matched user(s) paused.`,
+        );
+        await processInPool(selected, config.concurrency, async (match) => {
+          const deadline = createDeadlineSignal(
+            runSignal,
+            userSyncTimeoutMs,
+            `User calendar synchronization timed out after ${durationLabel(userSyncTimeoutMs)}.`,
+          );
+          try {
+            await syncUser(match, run, schoolbox, google, {
+              pastDays: config.pastDays,
+              futureDays: config.futureDays,
+              timezone: config.timezone,
+              syncPolicy: config.syncPolicy,
+              signal: deadline.signal,
+            });
+          } finally {
+            deadline.dispose();
+          }
+          throwIfAborted(runSignal);
+          await checkpointRun(
+            run,
+            "user_sync",
+            `${run.usersSynced + run.errors} of ${selected.length} enabled user calendar(s) processed.`,
+          );
+        }, runSignal);
+        throwIfAborted(runSignal);
+        await checkpointRun(run, "finalizing", "Finalizing run counters and audit status.");
+        run.status = run.errors > 0 ? "completed_with_errors" : "completed";
+        const paused = matched.length - selected.length;
+        run.message = run.errors > 0
+          ? `${run.errors} user syncs require attention; ${paused} matched user(s) were paused.`
+          : `Organization sync completed; ${run.usersSynced} user(s) synced and ${paused} matched user(s) paused.`;
+      },
     );
-    run.status = run.errors > 0 ? "completed_with_errors" : "completed";
-    const paused = matched.length - selected.length;
-    run.message = run.errors > 0
-      ? `${run.errors} user syncs require attention; ${paused} matched user(s) were paused.`
-      : `Organization sync completed; ${run.usersSynced} user(s) synced and ${paused} matched user(s) paused.`;
   } catch (error) {
     run.status = "failed";
     run.errors += 1;
-    run.message = error instanceof Error ? error.message : "The organization sync failed.";
+    run.message = syncErrorMessage(error);
   } finally {
     clearInterval(heartbeat);
     run.completedAt = new Date().toISOString();
