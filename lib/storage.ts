@@ -434,6 +434,10 @@ export async function ensureSchema(): Promise<void> {
   }
   binding.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS user_mappings_active_email_idx
     ON user_mappings (google_email COLLATE NOCASE) WHERE directory_active = 1`).run();
+  // An unmatched Google account has no Schoolbox identity to sync. Keep this
+  // invariant in storage so legacy data and direct API calls cannot make the
+  // account appear enabled or inflate the paused-user total.
+  binding.prepare("UPDATE user_mappings SET sync_enabled = 0 WHERE schoolbox_user_id IS NULL AND sync_enabled <> 0").run();
   await binding
     .prepare("INSERT OR IGNORE INTO app_config (id, updated_at) VALUES (1, ?)")
     .bind(new Date().toISOString())
@@ -1026,6 +1030,10 @@ export async function discoverUserMappings(
         ELSE user_mappings.last_error
       END,
       event_count=user_mappings.event_count,
+      sync_enabled=CASE
+        WHEN excluded.schoolbox_user_id IS NULL THEN 0
+        ELSE user_mappings.sync_enabled
+      END,
       directory_active=1,
       updated_at=excluded.updated_at`);
   const selection = binding.prepare("SELECT sync_enabled FROM user_mappings WHERE google_user_id = ?");
@@ -1050,7 +1058,7 @@ export async function discoverUserMappings(
         mapping.lastSyncAt,
         mapping.lastError,
         mapping.eventCount,
-        Number(defaultEnabled),
+        Number(defaultEnabled && mapping.schoolboxUserId !== null),
         mapping.updatedAt,
       ).run();
       const row = selection.bind(mapping.googleUserId).first<{ sync_enabled: number }>();
@@ -1067,13 +1075,17 @@ export async function setUsersSyncEnabled(ids: string[], enabled: boolean, actor
   if (uniqueIds.length > 25_000) throw new HttpError(400, "Update no more than 25,000 users at a time");
 
   const binding = db();
-  const exists = binding.prepare("SELECT google_user_id FROM user_mappings WHERE google_user_id = ? AND directory_active = 1");
+  const exists = binding.prepare("SELECT google_user_id, schoolbox_user_id FROM user_mappings WHERE google_user_id = ? AND directory_active = 1");
   const update = binding.prepare("UPDATE user_mappings SET sync_enabled = ?, updated_at = ? WHERE google_user_id = ? AND directory_active = 1");
   const audit = binding.prepare("INSERT INTO audit_log (occurred_at, actor, action, detail) VALUES (?, ?, 'users.sync_selection_updated', ?)");
   const now = new Date().toISOString();
   const updated = binding.transaction(() => {
     for (const id of uniqueIds) {
-      if (!exists.bind(id).first()) throw new HttpError(404, "One or more users are no longer available");
+      const user = exists.bind(id).first<{ google_user_id: string; schoolbox_user_id: string | null }>();
+      if (!user) throw new HttpError(404, "One or more users are no longer available");
+      if (enabled && user.schoolbox_user_id === null) {
+        throw new HttpError(409, "Unmatched users cannot be enabled until a Schoolbox identity is discovered");
+      }
     }
     let changes = 0;
     for (const id of uniqueIds) {
@@ -1356,8 +1368,8 @@ export async function statusSnapshot(): Promise<{
   const [runs, userCounts, events] = await Promise.all([
     listRuns(1),
     db().prepare(`SELECT SUM(CASE WHEN directory_active = 1 THEN 1 ELSE 0 END) AS users,
-      SUM(CASE WHEN directory_active = 1 AND sync_enabled = 1 THEN 1 ELSE 0 END) AS enabled,
-      SUM(CASE WHEN directory_active = 1 AND sync_enabled = 0 THEN 1 ELSE 0 END) AS disabled,
+      SUM(CASE WHEN directory_active = 1 AND schoolbox_user_id IS NOT NULL AND sync_enabled = 1 THEN 1 ELSE 0 END) AS enabled,
+      SUM(CASE WHEN directory_active = 1 AND schoolbox_user_id IS NOT NULL AND sync_enabled = 0 THEN 1 ELSE 0 END) AS disabled,
       SUM(CASE WHEN directory_active = 1 AND sync_enabled = 1 AND status = 'synced' THEN 1 ELSE 0 END) AS healthy,
       SUM(CASE WHEN directory_active = 1 AND sync_enabled = 1 AND status = 'error' THEN 1 ELSE 0 END) AS errors,
       SUM(CASE WHEN directory_active = 1 AND status = 'unmatched' THEN 1 ELSE 0 END) AS unmatched

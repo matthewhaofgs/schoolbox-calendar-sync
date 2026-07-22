@@ -209,10 +209,17 @@ test("paused unmatched accounts remain informational in aggregate counts", async
       status: "unmatched",
       lastError: "No active Schoolbox user has this primary email address.",
     }),
-  ], false);
+  ], true);
+  const [mapping] = await storage.listUserMappings();
+  assert.equal(mapping.syncEnabled, false, "the new-user default cannot enable an unmatched account");
+  await assert.rejects(
+    storage.setUsersSyncEnabled(["google-only"], true, "local:administrator"),
+    /unmatched users cannot be enabled/i,
+  );
   const snapshot = await storage.statusSnapshot();
   assert.equal(snapshot.counts.unmatched, 1);
   assert.equal(snapshot.counts.enabled, 0);
+  assert.equal(snapshot.counts.disabled, 0, "unmatched accounts are not paused users");
   assert.equal(snapshot.counts.errors, 0);
 });
 
