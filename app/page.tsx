@@ -97,6 +97,70 @@ type Run = {
   errors?: number;
 };
 
+type RunUserDiagnostic = {
+  runId: string;
+  googleUserId: string;
+  googleEmail: string;
+  displayName: string | null;
+  schoolboxUserId: number | null;
+  schoolboxEmail: string | null;
+  status: string;
+  stage: string;
+  startedAt: string;
+  completedAt: string | null;
+  eventsFound: number;
+  eventsIncluded: number;
+  eventsCreated: number;
+  eventsUpdated: number;
+  eventsDeleted: number;
+  eventsUnchanged: number;
+  managedEventsAfter: number;
+  errorMessage: string | null;
+};
+
+type DiagnosticEvent = {
+  runId?: string;
+  googleUserId: string;
+  sourceKey: string;
+  title: string | null;
+  description: string | null;
+  location: string | null;
+  author: string | null;
+  eventType: string | null;
+  category: string | null;
+  sourceStart: string | null;
+  sourceEnd: string | null;
+  allDay: boolean;
+  sourceUrl: string | null;
+  googleEventId: string | null;
+  calendarId: string | null;
+  destinationId: string | null;
+  action?: string;
+  detail?: string | null;
+  errorMessage?: string | null;
+  recordedAt?: string;
+  lastSeenRunId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type UserCalendarDetail = {
+  destinationId: string;
+  googleCalendarId: string;
+  summary: string;
+  description: string;
+  timeZone: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type UserDetailPayload = {
+  user: Record<string, unknown>;
+  events: DiagnosticEvent[];
+  calendars: UserCalendarDetail[];
+  runs: RunUserDiagnostic[];
+};
+
 const SCOPES = [
   "https://www.googleapis.com/auth/calendar.events.owned",
   "https://www.googleapis.com/auth/calendar.app.created",
@@ -713,6 +777,49 @@ function StatusPill({ status }: { status: Person["status"] | Run["status"] }) {
   return <span className={`status-pill ${tone}`}><i />{status}</span>;
 }
 
+function diagnosticDate(value: string | null | undefined): string {
+  if (!value) return "Not recorded";
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? value : new Date(parsed).toLocaleString("en-AU");
+}
+
+function safeExternalUrl(value: string | null | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function DiagnosticEventList({ events, empty = "No event detail was recorded." }: { events: DiagnosticEvent[]; empty?: string }) {
+  if (events.length === 0) return <div className="diagnostic-empty">{empty}</div>;
+  return <div className="diagnostic-events">{events.map(event =>
+    <details className={`diagnostic-event action-${event.action ?? "managed"}`} key={`${event.runId ?? "current"}:${event.sourceKey}`}>
+      <summary><div><b>{event.title || "Untitled event"}</b><small>{diagnosticDate(event.sourceStart)}{event.sourceEnd ? ` - ${diagnosticDate(event.sourceEnd)}` : ""}</small></div><span>{event.action ?? "managed"}</span></summary>
+      <div className="diagnostic-event-body">
+        {event.errorMessage && <p className="diagnostic-error"><b>Error</b>{event.errorMessage}</p>}
+        {event.detail && <p>{event.detail}</p>}
+        <dl>
+          <div><dt>Event type</dt><dd>{event.eventType || "Not supplied"}</dd></div>
+          <div><dt>Category</dt><dd>{event.category || "Not supplied"}</dd></div>
+          <div><dt>Time format</dt><dd>{event.allDay ? "All day" : "Timed"}</dd></div>
+          <div><dt>Destination</dt><dd>{event.destinationId || event.calendarId || "Primary / not recorded"}</dd></div>
+          <div><dt>Source key</dt><dd><code>{event.sourceKey}</code></dd></div>
+          <div><dt>Google event ID</dt><dd><code>{event.googleEventId || "Not created"}</code></dd></div>
+          <div><dt>Google calendar ID</dt><dd><code>{event.calendarId || "Not recorded"}</code></dd></div>
+          <div><dt>Last recorded</dt><dd>{diagnosticDate(event.recordedAt || event.updatedAt)}</dd></div>
+        </dl>
+        {event.location && <p><b>Location</b>{event.location}</p>}
+        {event.author && <p><b>Author</b>{event.author}</p>}
+        {event.description && <p className="diagnostic-description"><b>Description</b>{event.description}</p>}
+        {safeExternalUrl(event.sourceUrl) && <a href={safeExternalUrl(event.sourceUrl) ?? undefined} target="_blank" rel="noreferrer">Open source in Schoolbox <span aria-hidden="true">↗</span></a>}
+      </div>
+    </details>,
+  )}</div>;
+}
+
 type Config = {
   schoolboxUrl: string;
   schoolboxJwt: string;
@@ -866,6 +973,11 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
   const [coverageFilter, setCoverageFilter] = useState("All coverage");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  const [selectedPerson, setSelectedPerson] = useState<Person | null>(null);
+  const [userDetail, setUserDetail] = useState<UserDetailPayload | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
+  const [diagnosticPersonId, setDiagnosticPersonId] = useState("");
   const [page, setPage] = useState(0);
   const pageSize = 100;
   const selectAllRef = useRef<HTMLInputElement>(null);
@@ -881,6 +993,21 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
   const selectedVisible = selectedIds.length;
   const enabledCount = people.length ? people.filter(person => person.syncEnabled).length : counts?.enabled ?? 0;
   const pausedCount = people.length ? people.length - enabledCount : counts?.disabled ?? 0;
+
+  const openPersonDetail = async (person: Person) => {
+    setSelectedPerson(person);
+    setUserDetail(null);
+    setDetailError("");
+    setDetailLoading(true);
+    try {
+      const payload = await fetchJson(`/api/user-details?userId=${encodeURIComponent(person.id)}`);
+      setUserDetail(payload as unknown as UserDetailPayload);
+    } catch (error) {
+      setDetailError(error instanceof Error ? error.message : "User diagnostics could not be loaded.");
+    } finally {
+      setDetailLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (selectAllRef.current) selectAllRef.current.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
@@ -973,18 +1100,116 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
     <section className="people-summary"><div><span className="summary-icon green">#</span><p><b>{people.length || counts?.users || 0}</b><small>Discovered</small></p></div><div><span className="summary-icon green">✓</span><p><b>{enabledCount}</b><small>Enabled</small></p></div><div><span className="summary-icon amber">Ⅱ</span><p><b>{pausedCount}</b><small>Paused</small></p></div><div><span className="summary-icon blue">○</span><p><b>{people.length ? people.filter(p => p.status === "Unmatched").length : counts?.unmatched ?? 0}</b><small>Unmatched</small></p></div></section>
     <section className="panel people-panel" aria-busy={busy}><div className="people-tools"><div className="search-box"><span aria-hidden="true">⌕</span><input value={query} onChange={e => { setQuery(e.target.value); setPage(0); setSelected(new Set()); }} placeholder="Search people or email…" aria-label="Search people" /></div><select value={coverageFilter} onChange={e => { setCoverageFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter calendar sync coverage"><option>All coverage</option><option>Enabled</option><option>Paused</option></select><select value={statusFilter} onChange={e => { setStatusFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter sync status"><option>All statuses</option><option>Synced</option><option>Syncing</option><option>Pending</option><option>Unmatched</option><option>Error</option></select><button className="button ghost" onClick={exportCsv}>Export CSV</button></div>
       {canConfigure && selectedVisible > 0 && <div className="people-bulk" role="status"><b>{selectedVisible} selected</b><span>Bulk changes apply only to the selected visible users.</span><button className="button secondary" onClick={() => void updateCoverage(selectedIds, true)} disabled={busy}>Enable selected</button><button className="button ghost" onClick={() => void updateCoverage(selectedIds, false)} disabled={busy}>Pause selected</button></div>}
-      <div className="coverage-note"><span>i</span><p><b>Pausing stops future updates.</b> Remove Relay events leaves every unrelated entry alone. Delete Relay calendars also permanently removes all content inside Relay-created secondary calendars, including manually added entries.</p></div>
+      <div className="coverage-note"><span>i</span><p><b>Detailed diagnostics are available to authenticated IT staff.</b> Choose a person below to inspect identities, errors, calendars, managed events, and recent run outcomes.</p></div>
+      <div className="diagnostic-picker"><div><b>Person and event diagnostics</b><small>Search or filter the table, then choose any visible person.</small></div><select value={diagnosticPersonId} onChange={event => setDiagnosticPersonId(event.target.value)} aria-label="Choose a person for diagnostics"><option value="">Choose a person…</option>{visible.map(person => <option key={person.id} value={person.id}>{person.name} — {person.googleEmail}</option>)}</select><button className="button secondary" disabled={!diagnosticPersonId} onClick={() => { const person = people.find(candidate => candidate.id === diagnosticPersonId); if (person) void openPersonDetail(person); }}>View details</button></div>
       <div className="table-wrap"><table className="people-table"><caption className="sr-only">Discovered Google Workspace users and their Schoolbox calendar sync coverage</caption><thead><tr>{canConfigure && <th scope="col" className="selection-column"><input ref={selectAllRef} type="checkbox" checked={visible.length > 0 && selectedVisible === visible.length} onChange={event => selectVisible(event.target.checked)} aria-label="Select visible users" disabled={busy || visible.length === 0} /></th>}<th scope="col">Person</th><th scope="col">Schoolbox identity</th><th scope="col">Google Workspace</th><th scope="col">Role</th><th scope="col">Calendar sync</th><th scope="col">Relay data</th><th scope="col">Status</th><th scope="col">Last sync</th></tr></thead><tbody>{visible.map(person => <tr key={person.id}>{canConfigure && <td className="selection-column"><input type="checkbox" checked={selected.has(person.id)} onChange={event => selectOne(person.id, event.target.checked)} aria-label={`Select ${person.name}`} disabled={busy} /></td>}<th scope="row" className="person-row-header"><div className="person-cell"><span className="person-avatar">{person.name.split(" ").map(part => part[0]).join("").slice(0, 2)}</span><div><b>{person.name}</b><small>{person.id}</small></div></div></th><td>{person.schoolboxEmail}</td><td className={person.googleEmail === "—" ? "muted" : ""}>{person.googleEmail}</td><td>{person.role}</td><td>{canConfigure ? <label className="sync-switch"><input type="checkbox" checked={person.syncEnabled} onChange={event => void updateCoverage([person.id], event.target.checked)} disabled={busy} aria-label={`Sync calendar for ${person.name}`} /><span aria-hidden="true" /><b>{person.syncEnabled ? "Enabled" : "Paused"}</b></label> : <span className={`coverage-state ${person.syncEnabled ? "enabled" : "paused"}`}>{person.syncEnabled ? "Enabled" : "Paused"}</span>}</td><td><div className="managed-events-cell"><span><b>{person.eventCount}</b> event(s)</span><span><b>{person.calendarCount}</b> calendar(s)</span>{canConfigure && <button type="button" onClick={() => void cleanupManagedEvents(person)} disabled={busy || person.eventCount === 0} title={person.eventCount === 0 ? "No Relay-managed events to remove" : "Pause this user and remove only Relay-managed events"}>Remove Relay events</button>}{canConfigure && person.calendarCount > 0 && <button type="button" onClick={() => void cleanupManagedEvents(person, true)} disabled={busy} title="Pause this user, remove Relay-managed events, and delete Relay-created secondary calendars">Delete Relay calendars</button>}</div></td><td><StatusPill status={person.status} /></td><td>{person.lastSync}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state"><b>{loadError ? "People could not be loaded" : people.length === 0 ? "No people discovered yet" : "No people found"}</b><p>{loadError ? "Refresh after checking the server connection and logs." : people.length === 0 ? "Complete setup and run a sync to discover Workspace users. If the new-user default is paused, discovery will not write calendar events." : "Try different search or filter options."}</p></div>}</div>
       <div className="table-footer"><span>{filtered.length ? `Showing ${pageIndex * pageSize + 1}–${Math.min((pageIndex + 1) * pageSize, filtered.length)} of ${filtered.length} matching people` : `0 of ${people.length} people`}</span><div><button onClick={() => { setPage(Math.max(0, pageIndex - 1)); setSelected(new Set()); }} disabled={pageIndex === 0}>Previous</button><span>Page {pageIndex + 1} of {pageCount}</span><button onClick={() => { setPage(Math.min(pageCount - 1, pageIndex + 1)); setSelected(new Set()); }} disabled={pageIndex >= pageCount - 1}>Next</button></div></div>
     </section>
+    {selectedPerson && <UserDiagnosticsDrawer person={selectedPerson} detail={userDetail} loading={detailLoading} error={detailError} onClose={() => setSelectedPerson(null)} onRetry={() => void openPersonDetail(selectedPerson)} />}
   </>;
+}
+
+function UserDiagnosticsDrawer({ person, detail, loading, error, onClose, onRetry }: {
+  person: Person;
+  detail: UserDetailPayload | null;
+  loading: boolean;
+  error: string;
+  onClose: () => void;
+  onRetry: () => void;
+}) {
+  return <div className="detail-backdrop" role="presentation" onMouseDown={onClose}><aside className="admin-detail-drawer" role="dialog" aria-modal="true" aria-label={`Diagnostics for ${person.name}`} onMouseDown={event => event.stopPropagation()}>
+    <div className="drawer-head"><div><p className="eyebrow">Person diagnostics</p><h2>{person.name}</h2><small>{person.googleEmail}</small></div><button onClick={onClose} aria-label="Close person diagnostics">×</button></div>
+    {loading && <div className="diagnostic-empty">Loading identities, calendars, events, and run history…</div>}
+    {error && <div className="diagnostic-error-box"><b>Diagnostics unavailable</b><p>{error}</p><button className="button secondary" onClick={onRetry}>Try again</button></div>}
+    {detail && <>
+      <div className="drawer-summary"><span><small>Status</small><b>{person.status}</b></span><span><small>Coverage</small><b>{person.syncEnabled ? "Enabled" : "Paused"}</b></span><span><small>Schoolbox ID</small><b>{String(detail.user.schoolboxUserId ?? "Unmatched")}</b></span><span><small>Managed data</small><b>{detail.events.length} event(s), {detail.calendars.length} calendar(s)</b></span></div>
+      <h3>Identities</h3><dl className="diagnostic-grid"><div><dt>Google Workspace</dt><dd>{person.googleEmail}</dd></div><div><dt>Schoolbox</dt><dd>{person.schoolboxEmail}</dd></div><div><dt>Google user ID</dt><dd><code>{person.id}</code></dd></div><div><dt>Role</dt><dd>{person.role}</dd></div></dl>
+      {typeof detail.user.lastError === "string" && detail.user.lastError && <div className="diagnostic-error-box"><b>Latest user error</b><p>{detail.user.lastError}</p></div>}
+      <h3>Relay-created calendars</h3>
+      {detail.calendars.length ? <div className="diagnostic-calendars">{detail.calendars.map(calendar => <details key={calendar.destinationId}><summary><b>{calendar.summary}</b><span>{calendar.destinationId}</span></summary><dl className="diagnostic-grid"><div><dt>Google calendar ID</dt><dd><code>{calendar.googleCalendarId}</code></dd></div><div><dt>Time zone</dt><dd>{calendar.timeZone}</dd></div><div><dt>Description</dt><dd>{calendar.description || "None"}</dd></div><div><dt>Updated</dt><dd>{diagnosticDate(calendar.updatedAt)}</dd></div></dl></details>)}</div> : <div className="diagnostic-empty">No Relay-created secondary calendars are recorded.</div>}
+      <h3>Current managed events</h3><DiagnosticEventList events={detail.events} empty="No managed events are currently recorded for this person." />
+      <h3>Recent run outcomes</h3>
+      {detail.runs.length ? <div className="diagnostic-run-list">{detail.runs.map(outcome => <div className={outcome.status === "failed" ? "failed" : ""} key={outcome.runId}><b>{outcome.status} · {diagnosticDate(outcome.completedAt || outcome.startedAt)}</b><small>{outcome.eventsFound} found · {outcome.eventsCreated} created · {outcome.eventsUpdated} updated · {outcome.eventsDeleted} deleted · {outcome.eventsUnchanged} unchanged</small>{outcome.errorMessage && <p>{outcome.errorMessage}</p>}</div>)}</div> : <div className="diagnostic-empty">Detailed per-run history starts with the next run on the enhanced diagnostic schema.</div>}
+    </>}
+  </aside></div>;
 }
 
 function RunsPage({ runs, selectedRun, setSelectedRun, runNow, syncRunning, canOperate, loadError }: { runs: Run[]; selectedRun: Run | null; setSelectedRun: (run: Run | null) => void; runNow: () => Promise<void>; syncRunning: boolean; canOperate: boolean; loadError: boolean }) {
   const [status, setStatus] = useState("All statuses");
+  const [detailUsers, setDetailUsers] = useState<RunUserDiagnostic[]>([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
+  const [userQuery, setUserQuery] = useState("");
+  const [selectedOutcome, setSelectedOutcome] = useState<RunUserDiagnostic | null>(null);
+  const [events, setEvents] = useState<DiagnosticEvent[]>([]);
+  const [eventTotal, setEventTotal] = useState(0);
+  const [eventsLoading, setEventsLoading] = useState(false);
   const filtered = runs.filter(run => status === "All statuses" || run.status === status);
+  const failures = detailUsers.filter(user => user.status === "failed");
+  const visibleOutcomes = detailUsers.filter(user => `${user.displayName ?? ""} ${user.googleEmail} ${user.schoolboxEmail ?? ""} ${user.stage} ${user.errorMessage ?? ""}`.toLowerCase().includes(userQuery.toLowerCase()));
+
+  const loadOutcome = useCallback(async (outcome: RunUserDiagnostic) => {
+    if (!selectedRun) return;
+    setSelectedOutcome(outcome);
+    setEvents([]);
+    setEventTotal(0);
+    setEventsLoading(true);
+    try {
+      const payload = await fetchJson(`/api/run-details?runId=${encodeURIComponent(selectedRun.id)}&userId=${encodeURIComponent(outcome.googleUserId)}&limit=250`);
+      setEvents((payload.events as DiagnosticEvent[] | undefined) ?? []);
+      setEventTotal(Number(payload.total ?? 0));
+    } catch (error) {
+      setDetailError(error instanceof Error ? error.message : "Event diagnostics could not be loaded.");
+    } finally {
+      setEventsLoading(false);
+    }
+  }, [selectedRun]);
+
+  const loadMoreEvents = async () => {
+    if (!selectedRun || !selectedOutcome || eventsLoading || events.length >= eventTotal) return;
+    setEventsLoading(true);
+    try {
+      const payload = await fetchJson(`/api/run-details?runId=${encodeURIComponent(selectedRun.id)}&userId=${encodeURIComponent(selectedOutcome.googleUserId)}&limit=250&offset=${events.length}`);
+      setEvents(current => [...current, ...((payload.events as DiagnosticEvent[] | undefined) ?? [])]);
+      setEventTotal(Number(payload.total ?? eventTotal));
+    } catch (error) {
+      setDetailError(error instanceof Error ? error.message : "Additional event diagnostics could not be loaded.");
+    } finally {
+      setEventsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedRun) return () => { cancelled = true; };
+    void (async () => {
+      await Promise.resolve();
+      if (cancelled) return;
+      setDetailUsers([]);
+      setSelectedOutcome(null);
+      setEvents([]);
+      setDetailError("");
+      setUserQuery("");
+      setDetailLoading(true);
+      try {
+        const payload = await fetchJson(`/api/run-details?runId=${encodeURIComponent(selectedRun.id)}`);
+        if (cancelled) return;
+        const outcomes = (payload.users as RunUserDiagnostic[] | undefined) ?? [];
+        setDetailUsers(outcomes);
+        const firstFailure = outcomes.find(outcome => outcome.status === "failed");
+        if (firstFailure) void loadOutcome(firstFailure);
+      } catch (error) {
+        if (!cancelled) setDetailError(error instanceof Error ? error.message : "Run diagnostics could not be loaded.");
+      } finally {
+        if (!cancelled) setDetailLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedRun, loadOutcome]);
+
   const downloadRun = (run: Run) => {
-    const url = URL.createObjectURL(new Blob([JSON.stringify(run, null, 2)], { type: "application/json" }));
+    const diagnostic = { run, users: detailUsers, selectedUser: selectedOutcome, events, eventTotal };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(diagnostic, null, 2)], { type: "application/json" }));
     const link = document.createElement("a");
     link.href = url;
     link.download = `${run.id}-diagnostic.json`;
@@ -995,7 +1220,21 @@ function RunsPage({ runs, selectedRun, setSelectedRun, runNow, syncRunning, canO
     <div>
       <section className="panel runs-panel"><div className="people-tools"><div><h2>Run history</h2><p>All scheduled and manual sync attempts</p></div><select value={status} onChange={e => setStatus(e.target.value)} aria-label="Filter run status"><option>All statuses</option><option>Succeeded</option><option>Warning</option><option>Failed</option></select>{canOperate && <button className="button secondary" onClick={() => void runNow()} disabled={syncRunning}>{syncRunning ? "Starting…" : "Run diagnostic sync"}</button>}</div><div className="table-wrap"><table><thead><tr><th>Run</th><th>Started</th><th>Status</th><th>Synced</th><th>Changes</th><th>Duration</th><th><span className="sr-only">Open</span></th></tr></thead><tbody>{filtered.map(run => <RunRow key={run.id} run={run} onClick={() => setSelectedRun(run)} />)}{filtered.length === 0 && <tr><td colSpan={7} className="table-empty">{loadError ? "Run history could not be loaded." : "No matching runs. Start a sync when setup is complete."}</td></tr>}</tbody></table></div></section>
     </div>
-    {selectedRun && <aside className="run-drawer"><div className="drawer-head"><div><p className="eyebrow">Run detail</p><h2>{selectedRun.id}</h2></div><button onClick={() => setSelectedRun(null)} aria-label="Close run details">×</button></div><StatusPill status={selectedRun.status} /><div className="drawer-summary"><span><small>Started</small><b>{selectedRun.started}</b></span><span><small>Duration</small><b>{selectedRun.duration}</b></span><span><small>Trigger</small><b>{selectedRun.trigger}</b></span><span><small>People synced</small><b>{selectedRun.users}</b></span><span><small>Current phase</small><b>{selectedRun.phase.replaceAll("_", " ")}</b></span><span><small>Last progress</small><b>{selectedRun.progressAt ? new Date(selectedRun.progressAt).toLocaleTimeString("en-AU") : "Not recorded"}</b></span></div><h3>{selectedRun.status === "Running" ? "Current operation" : "Run narrative"}</h3><p>{selectedRun.status === "Running" ? selectedRun.phaseDetail : selectedRun.note}</p><div className="event-stats"><div><span className="stat-mark green">+</span><b>{selectedRun.created ?? 0}</b><small>Created</small></div><div><span className="stat-mark navy">↻</span><b>{selectedRun.updated ?? 0}</b><small>Updated</small></div><div><span className="stat-mark red">−</span><b>{selectedRun.deleted ?? 0}</b><small>Removed</small></div></div><h3>Timeline</h3><ol className="run-timeline"><li className={selectedRun.usersDiscovered > 0 ? "done" : ""}><span>{selectedRun.usersDiscovered > 0 ? "✓" : "…"}</span><div><b>Users discovered</b><small>{selectedRun.usersDiscovered} directory identities loaded</small></div></li><li className={selectedRun.usersMatched > 0 ? "done" : ""}><span>{selectedRun.usersMatched > 0 ? "✓" : "…"}</span><div><b>Identity matches</b><small>{selectedRun.usersMatched} Schoolbox identities matched; {selectedRun.users} enabled calendars processed</small></div></li><li className={selectedRun.status === "Failed" ? "failed" : selectedRun.status === "Running" ? "" : "done"}><span>{selectedRun.status === "Failed" ? "!" : selectedRun.status === "Running" ? "…" : "✓"}</span><div><b>Google calendars updated</b><small>{selectedRun.status === "Failed" ? "Stopped after an API error" : selectedRun.status === "Running" ? selectedRun.phaseDetail : `${selectedRun.errors ?? 0} user errors recorded`}</small></div></li></ol>{canOperate && selectedRun.status !== "Succeeded" && selectedRun.status !== "Running" && <button className="button primary full" onClick={() => void runNow()}>Retry enabled-user sync <span>→</span></button>}<button className="button ghost full" onClick={() => downloadRun(selectedRun)}>Download run summary</button></aside>}
+    {selectedRun && <aside className="run-drawer enhanced-run-drawer">
+      <div className="drawer-head"><div><p className="eyebrow">Run detail</p><h2>{selectedRun.id}</h2></div><button onClick={() => setSelectedRun(null)} aria-label="Close run details">×</button></div>
+      <StatusPill status={selectedRun.status} />
+      <div className="drawer-summary"><span><small>Started</small><b>{selectedRun.started}</b></span><span><small>Duration</small><b>{selectedRun.duration}</b></span><span><small>Trigger</small><b>{selectedRun.trigger}</b></span><span><small>People synced</small><b>{selectedRun.users}</b></span><span><small>Current phase</small><b>{selectedRun.phase.replaceAll("_", " ")}</b></span><span><small>Last progress</small><b>{selectedRun.progressAt ? new Date(selectedRun.progressAt).toLocaleTimeString("en-AU") : "Not recorded"}</b></span></div>
+      <h3>{selectedRun.status === "Running" ? "Current operation" : "Run narrative"}</h3><p>{selectedRun.status === "Running" ? selectedRun.phaseDetail : selectedRun.note}</p>
+      <div className="event-stats"><div><span className="stat-mark green">+</span><b>{selectedRun.created ?? 0}</b><small>Created</small></div><div><span className="stat-mark navy">↻</span><b>{selectedRun.updated ?? 0}</b><small>Updated</small></div><div><span className="stat-mark red">−</span><b>{selectedRun.deleted ?? 0}</b><small>Removed</small></div></div>
+      {detailLoading && <div className="diagnostic-empty">Loading per-user outcomes…</div>}
+      {detailError && <div className="diagnostic-error-box"><b>Diagnostic detail</b><p>{detailError}</p></div>}
+      {failures.length > 0 && <><h3>Users requiring attention</h3><div className="run-failures">{failures.map(failure => <button key={failure.googleUserId} className={selectedOutcome?.googleUserId === failure.googleUserId ? "selected" : ""} onClick={() => void loadOutcome(failure)}><b>{failure.displayName || failure.googleEmail}</b><small>{failure.googleEmail} · {failure.stage.replaceAll("_", " ")}</small><p>{failure.errorMessage}</p></button>)}</div></>}
+      <h3>User outcomes</h3>
+      {detailUsers.length > 0 ? <><div className="diagnostic-user-search"><input value={userQuery} onChange={event => setUserQuery(event.target.value)} placeholder="Search name, email, stage or error…" aria-label="Search run user outcomes" /><span>{visibleOutcomes.length} of {detailUsers.length}</span></div><div className="run-user-outcomes">{visibleOutcomes.map(outcome => <button key={outcome.googleUserId} className={`${outcome.status} ${selectedOutcome?.googleUserId === outcome.googleUserId ? "selected" : ""}`} onClick={() => void loadOutcome(outcome)}><span><b>{outcome.displayName || outcome.googleEmail}</b><small>{outcome.googleEmail}</small></span><span><b>{outcome.status}</b><small>{outcome.eventsCreated} + · {outcome.eventsUpdated} ↻ · {outcome.eventsDeleted} −</small></span></button>)}</div></> : !detailLoading && <div className="diagnostic-empty">Detailed user outcomes were not recorded for this older run.</div>}
+      {selectedOutcome && <section className="selected-outcome"><h3>Selected user</h3><div className="selected-outcome-head"><div><b>{selectedOutcome.displayName || selectedOutcome.googleEmail}</b><small>{selectedOutcome.googleEmail} · Schoolbox {selectedOutcome.schoolboxEmail || selectedOutcome.schoolboxUserId || "not matched"}</small></div><span className={selectedOutcome.status}>{selectedOutcome.status}</span></div>{selectedOutcome.errorMessage && <div className="diagnostic-error-box"><b>Failure during {selectedOutcome.stage.replaceAll("_", " ")}</b><p>{selectedOutcome.errorMessage}</p></div>}<dl className="diagnostic-grid"><div><dt>Events returned</dt><dd>{selectedOutcome.eventsFound}</dd></div><div><dt>Included by policy</dt><dd>{selectedOutcome.eventsIncluded}</dd></div><div><dt>Managed afterward</dt><dd>{selectedOutcome.managedEventsAfter}</dd></div><div><dt>Completed</dt><dd>{diagnosticDate(selectedOutcome.completedAt)}</dd></div></dl><h3>Event actions</h3>{eventsLoading && events.length === 0 ? <div className="diagnostic-empty">Loading event actions…</div> : <DiagnosticEventList events={events} empty="No event action was recorded before this user outcome." />}{eventTotal > events.length && <button className="button secondary full diagnostic-load-more" disabled={eventsLoading} onClick={() => void loadMoreEvents()}>{eventsLoading ? "Loading…" : `Load more events (${events.length} of ${eventTotal})`}</button>}</section>}
+      {canOperate && selectedRun.status !== "Succeeded" && selectedRun.status !== "Running" && <button className="button primary full" onClick={() => void runNow()}>Retry enabled-user sync <span>→</span></button>}
+      <button className="button ghost full" onClick={() => downloadRun(selectedRun)}>Download loaded diagnostic data</button>
+    </aside>}
   </div>;
 }
 

@@ -1,0 +1,53 @@
+import { requestActor } from "@/lib/auth";
+import { HttpError, jsonError } from "@/lib/security";
+import {
+  getRun,
+  listRunEventDiagnostics,
+  listRunUserDiagnostics,
+} from "@/lib/storage";
+
+export const dynamic = "force-dynamic";
+
+const privateJson = (body: unknown) => Response.json(body, {
+  headers: { "Cache-Control": "private, no-store" },
+});
+
+function boundedInteger(value: string | null, fallback: number, minimum: number, maximum: number): number {
+  if (value === null) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new HttpError(400, `Expected an integer between ${minimum} and ${maximum}`);
+  }
+  return parsed;
+}
+
+export async function GET(request: Request) {
+  try {
+    await requestActor(request, "view");
+    const url = new URL(request.url);
+    const runId = url.searchParams.get("runId")?.trim();
+    const userId = url.searchParams.get("userId")?.trim();
+    if (!runId || runId.length > 200) throw new HttpError(400, "Choose a valid run");
+
+    const run = await getRun(runId);
+    if (!run) throw new HttpError(404, "Run not found");
+    const users = await listRunUserDiagnostics(runId);
+    if (!userId) return privateJson({ run, users });
+    if (userId.length > 200 || !users.some((user) => user.googleUserId === userId)) {
+      throw new HttpError(404, "This user has no detailed outcome for the selected run");
+    }
+
+    const limit = boundedInteger(url.searchParams.get("limit"), 100, 1, 250);
+    const offset = boundedInteger(url.searchParams.get("offset"), 0, 0, 1_000_000);
+    return privateJson({
+      run,
+      users,
+      selectedUser: users.find((user) => user.googleUserId === userId),
+      ...(await listRunEventDiagnostics(runId, userId, { limit, offset })),
+      limit,
+      offset,
+    });
+  } catch (error) {
+    return jsonError(error);
+  }
+}

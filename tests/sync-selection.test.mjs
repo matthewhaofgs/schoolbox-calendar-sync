@@ -106,6 +106,24 @@ test("runFullSync never processes paused matches and does process enabled matche
   assert.equal(mappings.get("google-paused")?.syncEnabled, false);
   assert.equal(mappings.get("google-paused")?.lastSyncAt, null);
 
+  const userOutcomes = await storage.listRunUserDiagnostics(enabledRun.id);
+  assert.equal(userOutcomes.length, 1, "paused users should not create run outcome rows");
+  assert.equal(userOutcomes[0].status, "completed");
+  assert.equal(userOutcomes[0].eventsFound, 1);
+  assert.equal(userOutcomes[0].eventsCreated, 1);
+  assert.equal(userOutcomes[0].managedEventsAfter, 1);
+
+  const eventOutcomes = await storage.listRunEventDiagnostics(enabledRun.id, "google-enabled");
+  assert.equal(eventOutcomes.total, 1);
+  assert.equal(eventOutcomes.events[0].action, "created");
+  assert.equal(eventOutcomes.events[0].title, "Calendar event for 101");
+  assert.equal(eventOutcomes.events[0].eventType, "event");
+  assert.equal(eventOutcomes.events[0].category, "other");
+
+  const currentEvents = await storage.getEventMappings("google-enabled");
+  assert.equal(currentEvents[0].title, "Calendar event for 101");
+  assert.equal(currentEvents[0].destinationId, "primary");
+
   const targetTimestamp = new Date().toISOString();
   await storage.upsertUserCalendarTarget({
     googleUserId: "google-enabled",

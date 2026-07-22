@@ -22,6 +22,7 @@ import {
   deleteEventMapping,
   discoverUserMappings,
   finishRun,
+  finishRunUserDiagnostic,
   getConfig,
   getEventMappings,
   getUserCalendarTarget,
@@ -30,15 +31,18 @@ import {
   listUserCalendarTargets,
   listRuns,
   recordManagedEventCleanup,
+  recordRunEventDiagnostic,
   recoverStaleRuns,
   recordDiscoveredEventTypes,
   saveConfig,
   setUsersSyncEnabled,
+  startRunUserDiagnostic,
   touchRunHeartbeat,
   touchEventMapping,
   upsertEventMapping,
   upsertUserCalendarTarget,
   upsertUserMapping,
+  type EventMapping,
   type RunSummary,
   type UserCalendarTarget,
 } from "./storage";
@@ -406,6 +410,63 @@ async function syncUser(
     role: schoolboxRole(match.schoolbox),
     updatedAt: new Date().toISOString(),
   };
+  const counters = {
+    eventsFound: 0,
+    eventsIncluded: 0,
+    eventsCreated: 0,
+    eventsUpdated: 0,
+    eventsDeleted: 0,
+    eventsUnchanged: 0,
+    managedEventsAfter: 0,
+  };
+  let stage = "fetching_events";
+  let activeEvent: NormalizedSchoolboxCalendarEvent | null = null;
+  let activeSourceKey: string | null = null;
+  let activeCalendarId: string | null = null;
+  let activeDestinationId: string | null = null;
+  let activeStoredMapping: EventMapping | null = null;
+
+  await startRunUserDiagnostic({
+    runId: run.id,
+    googleUserId,
+    googleEmail,
+    displayName: baseMapping.displayName,
+    schoolboxUserId: match.schoolbox.id,
+    schoolboxEmail: match.schoolboxEmail,
+  });
+
+  const recordEvent = async (
+    event: NormalizedSchoolboxCalendarEvent,
+    sourceKey: string,
+    action: string,
+    diagnostic: {
+      detail?: string | null;
+      errorMessage?: string | null;
+      googleEventId?: string | null;
+      calendarId?: string | null;
+      destinationId?: string | null;
+    } = {},
+  ) => recordRunEventDiagnostic({
+    runId: run.id,
+    googleUserId,
+    sourceKey,
+    title: event.title,
+    description: event.description,
+    location: event.location,
+    author: event.author,
+    eventType: event.type,
+    category: event.category ?? "other",
+    sourceStart: event.start,
+    sourceEnd: event.end,
+    allDay: event.allDay,
+    sourceUrl: event.sourceUrl,
+    googleEventId: diagnostic.googleEventId ?? null,
+    calendarId: diagnostic.calendarId ?? null,
+    destinationId: diagnostic.destinationId ?? null,
+    action,
+    detail: diagnostic.detail ?? null,
+    errorMessage: diagnostic.errorMessage ?? null,
+  });
 
   try {
     const [events, storedMappings, storedCalendarTargets] = await Promise.all([
@@ -418,6 +479,8 @@ async function syncUser(
       getEventMappings(googleUserId),
       listUserCalendarTargets(googleUserId),
     ]);
+    counters.eventsFound = events.length;
+    stage = "reconciling_calendars";
     await reconcileExistingCalendarTargets({
       targets: storedCalendarTargets,
       googleUserId,
@@ -433,6 +496,7 @@ async function syncUser(
     const excludedSourceRoots = new Set<string>();
     const calendarTargets = new Map<string, Promise<string>>();
     await recordDiscoveredEventTypes(events);
+    stage = "processing_events";
 
     const targetFor = (destinationId: string) => {
       const cached = calendarTargets.get(destinationId);
@@ -453,7 +517,15 @@ async function syncUser(
     for (const event of events) {
       throwIfAborted(options.signal);
       const sourceKey = `${event.sourceKey}:occurrence:${event.start}`;
-      if (seen.has(sourceKey) || excluded.has(sourceKey)) continue;
+      activeEvent = event;
+      activeSourceKey = sourceKey;
+      activeCalendarId = null;
+      activeDestinationId = null;
+      if (seen.has(sourceKey) || excluded.has(sourceKey)) {
+        activeEvent = null;
+        activeSourceKey = null;
+        continue;
+      }
       if (!eventIncludedByPolicy({
         category: event.category ?? "other",
         type: event.type,
@@ -462,23 +534,53 @@ async function syncUser(
       }, options.syncPolicy)) {
         excluded.add(sourceKey);
         excludedSourceRoots.add(event.sourceKey);
+        await recordEvent(event, sourceKey, "excluded", {
+          detail: options.syncPolicy.deleteExcludedEvents
+            ? "Excluded by current policy; any tracked Google copy will be removed."
+            : "Excluded by current policy; an existing Google copy is retained by configuration.",
+        });
+        activeEvent = null;
+        activeSourceKey = null;
         continue;
       }
       seen.add(sourceKey);
+      counters.eventsIncluded += 1;
       const googleRule = resolveGoogleEventRule({ category: event.category ?? "other", type: event.type }, options.syncPolicy);
+      activeDestinationId = googleRule.destinationId;
       const calendarId = await targetFor(googleRule.destinationId);
+      activeCalendarId = calendarId;
       const body = await eventBody(event, googleUserId, options.timezone, sourceKey, options.syncPolicy);
       const hash = await createContentHash(body);
       const mapping = existing.get(sourceKey);
       const calendarChanged = Boolean(mapping && mapping.calendarId !== calendarId);
 
       if (mapping?.sourceHash === hash && !calendarChanged) {
-        await touchEventMapping(googleUserId, sourceKey, run.id);
+        await touchEventMapping(googleUserId, sourceKey, run.id, {
+          title: event.title,
+          description: event.description,
+          location: event.location,
+          author: event.author,
+          eventType: event.type,
+          category: event.category ?? "other",
+          allDay: event.allDay,
+          sourceUrl: event.sourceUrl,
+          destinationId: googleRule.destinationId,
+        });
         run.eventsUnchanged += 1;
+        counters.eventsUnchanged += 1;
+        await recordEvent(event, sourceKey, "unchanged", {
+          googleEventId: mapping.googleEventId,
+          calendarId,
+          destinationId: googleRule.destinationId,
+          detail: "The managed Google event already matched the Schoolbox source.",
+        });
+        activeEvent = null;
+        activeSourceKey = null;
         continue;
       }
 
       let createdAt = mapping?.createdAt ?? new Date().toISOString();
+      let action: "created" | "updated" = "created";
       if (mapping && !calendarChanged) {
         await google.updateEvent(googleEmail, mapping.googleEventId, body, {
           calendarId,
@@ -487,6 +589,8 @@ async function syncUser(
           signal: options.signal,
         });
         run.eventsUpdated += 1;
+        counters.eventsUpdated += 1;
+        action = "updated";
       } else {
         let insertConflict = false;
         try {
@@ -519,9 +623,17 @@ async function syncUser(
             if (!(error instanceof GoogleApiError) || (error.status !== 404 && error.status !== 410)) throw error;
           }
           run.eventsUpdated += 1;
+          counters.eventsUpdated += 1;
+          action = "updated";
         } else {
-          if (insertConflict) run.eventsUpdated += 1;
-          else run.eventsCreated += 1;
+          if (insertConflict) {
+            run.eventsUpdated += 1;
+            counters.eventsUpdated += 1;
+            action = "updated";
+          } else {
+            run.eventsCreated += 1;
+            counters.eventsCreated += 1;
+          }
         }
       }
 
@@ -536,9 +648,29 @@ async function syncUser(
         lastSeenRunId: run.id,
         createdAt,
         updatedAt: new Date().toISOString(),
+        title: event.title,
+        description: event.description,
+        location: event.location,
+        author: event.author,
+        eventType: event.type,
+        category: event.category ?? "other",
+        allDay: event.allDay,
+        sourceUrl: event.sourceUrl,
+        destinationId: googleRule.destinationId,
       });
+      await recordEvent(event, sourceKey, action, {
+        googleEventId: body.id,
+        calendarId,
+        destinationId: googleRule.destinationId,
+        detail: calendarChanged
+          ? "The managed event was moved to its configured calendar destination."
+          : action === "created" ? "A new managed Google event was created." : "The managed Google event was updated.",
+      });
+      activeEvent = null;
+      activeSourceKey = null;
     }
 
+    stage = "reconciling_removed_events";
     for (const mapping of storedMappings) {
       throwIfAborted(options.signal);
       if (seen.has(mapping.sourceKey)) continue;
@@ -550,6 +682,10 @@ async function syncUser(
       const sourceEnd = new Date(mapping.sourceEnd);
       const wasInsideFetchedWindow = sourceStart < windowEnd && sourceEnd > windowStart;
       if (!wasInsideFetchedWindow) continue;
+      activeStoredMapping = mapping;
+      activeSourceKey = mapping.sourceKey;
+      activeCalendarId = mapping.calendarId;
+      activeDestinationId = mapping.destinationId;
       try {
         await google.deleteEvent(googleEmail, mapping.googleEventId, {
           calendarId: mapping.calendarId,
@@ -562,10 +698,38 @@ async function syncUser(
       }
       await deleteEventMapping(googleUserId, mapping.sourceKey);
       run.eventsDeleted += 1;
+      counters.eventsDeleted += 1;
+      await recordRunEventDiagnostic({
+        runId: run.id,
+        googleUserId,
+        sourceKey: mapping.sourceKey,
+        title: mapping.title,
+        description: mapping.description,
+        location: mapping.location,
+        author: mapping.author,
+        eventType: mapping.eventType,
+        category: mapping.category,
+        sourceStart: mapping.sourceStart,
+        sourceEnd: mapping.sourceEnd,
+        allDay: mapping.allDay,
+        sourceUrl: mapping.sourceUrl,
+        googleEventId: mapping.googleEventId,
+        calendarId: mapping.calendarId,
+        destinationId: mapping.destinationId,
+        action: "deleted",
+        detail: excludedByPolicy
+          ? "The managed Google event was deleted because the source is excluded by policy."
+          : "The managed Google event was deleted because it was no longer returned by Schoolbox.",
+        errorMessage: null,
+      });
+      activeStoredMapping = null;
+      activeSourceKey = null;
     }
 
     throwIfAborted(options.signal);
+    stage = "saving_user_result";
     const managedEventCount = (await getEventMappings(googleUserId)).length;
+    counters.managedEventsAfter = managedEventCount;
     await upsertUserMapping({
       ...baseMapping,
       status: "synced",
@@ -573,15 +737,62 @@ async function syncUser(
       lastError: null,
       eventCount: managedEventCount,
     });
+    await finishRunUserDiagnostic({
+      runId: run.id,
+      googleUserId,
+      status: "completed",
+      stage: "completed",
+      ...counters,
+      errorMessage: null,
+    });
     run.usersSynced += 1;
   } catch (error) {
     const message = syncErrorMessage(error, options.signal);
+    if (activeEvent && activeSourceKey) {
+      await recordEvent(activeEvent, activeSourceKey, "failed", {
+        googleEventId: null,
+        calendarId: activeCalendarId,
+        destinationId: activeDestinationId,
+        detail: `Failure while ${stage.replaceAll("_", " ")}.`,
+        errorMessage: message,
+      });
+    } else if (activeStoredMapping && activeSourceKey) {
+      await recordRunEventDiagnostic({
+        runId: run.id,
+        googleUserId,
+        sourceKey: activeSourceKey,
+        title: activeStoredMapping.title,
+        description: activeStoredMapping.description,
+        location: activeStoredMapping.location,
+        author: activeStoredMapping.author,
+        eventType: activeStoredMapping.eventType,
+        category: activeStoredMapping.category,
+        sourceStart: activeStoredMapping.sourceStart,
+        sourceEnd: activeStoredMapping.sourceEnd,
+        allDay: activeStoredMapping.allDay,
+        sourceUrl: activeStoredMapping.sourceUrl,
+        googleEventId: activeStoredMapping.googleEventId,
+        calendarId: activeCalendarId,
+        destinationId: activeDestinationId,
+        action: "failed",
+        detail: `Failure while ${stage.replaceAll("_", " ")}.`,
+        errorMessage: message,
+      });
+    }
     await upsertUserMapping({
       ...baseMapping,
       status: "error",
       lastSyncAt: new Date().toISOString(),
       lastError: message.slice(0, 2000),
       eventCount: 0,
+    });
+    await finishRunUserDiagnostic({
+      runId: run.id,
+      googleUserId,
+      status: "failed",
+      stage,
+      ...counters,
+      errorMessage: message,
     });
     run.errors += 1;
   }

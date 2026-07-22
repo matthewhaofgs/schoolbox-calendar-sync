@@ -60,7 +60,7 @@ Relay supports one application replica per SQLite database. The Node server list
 - Per-rule availability, visibility, colour, and reminder configuration
 - Configurable event content and title prefixes
 - Managed-event reconciliation, per-user cleanup, and managed-calendar retirement
-- Scheduled and manual runs with phase/page diagnostics, progress timestamps, and run history
+- Scheduled and manual runs with phase/page diagnostics, per-user outcomes, event-action drill-down, progress timestamps, and run history
 - Local break-glass administration and Google Workspace role-based access
 
 ## Requirements
@@ -208,6 +208,8 @@ Removing routing leaves existing Google calendars in place. **Retire and delete*
 Schoolbox API date ranges are divided into month-sized requests. Events with one missing timed boundary are normalized to a 30-minute duration; events with one missing all-day boundary are normalized to one calendar day.
 
 Run diagnostics distinguish the 30-second process heartbeat from meaningful progress. Discovery records separate Schoolbox and Google page checkpoints, user processing records aggregate completion, and finalization has its own phase. Configurable discovery, per-user, and whole-run deadlines abort stalled network work and ensure an unresolved dependency cannot leave a run permanently active.
+
+Authenticated IT staff can open a run to review every enabled-user outcome. Failures include the affected identities, processing stage, exact error, per-user counters, and any event being processed when the failure occurred. Event-action records include normalized Schoolbox content, source and Google identifiers, calendar routing, dates, action, and error context. The People screen exposes current managed events, Relay-created calendars, the latest user error, and recent run outcomes. High-volume historical drill-down data is retained for the newest 100 runs; run summaries remain available independently.
 
 ## Authentication and authorization
 

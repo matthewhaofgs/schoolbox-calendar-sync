@@ -95,6 +95,59 @@ export type EventMapping = {
   lastSeenRunId: string;
   createdAt: string;
   updatedAt: string;
+  title: string | null;
+  description: string | null;
+  location: string | null;
+  author: string | null;
+  eventType: string | null;
+  category: string | null;
+  allDay: boolean;
+  sourceUrl: string | null;
+  destinationId: string | null;
+};
+
+export type RunUserDiagnostic = {
+  runId: string;
+  googleUserId: string;
+  googleEmail: string;
+  displayName: string | null;
+  schoolboxUserId: number | null;
+  schoolboxEmail: string | null;
+  status: string;
+  stage: string;
+  startedAt: string;
+  completedAt: string | null;
+  eventsFound: number;
+  eventsIncluded: number;
+  eventsCreated: number;
+  eventsUpdated: number;
+  eventsDeleted: number;
+  eventsUnchanged: number;
+  managedEventsAfter: number;
+  errorMessage: string | null;
+};
+
+export type RunEventDiagnostic = {
+  runId: string;
+  googleUserId: string;
+  sourceKey: string;
+  title: string | null;
+  description: string | null;
+  location: string | null;
+  author: string | null;
+  eventType: string | null;
+  category: string | null;
+  sourceStart: string | null;
+  sourceEnd: string | null;
+  allDay: boolean;
+  sourceUrl: string | null;
+  googleEventId: string | null;
+  calendarId: string | null;
+  destinationId: string | null;
+  action: string;
+  detail: string | null;
+  errorMessage: string | null;
+  recordedAt: string;
 };
 
 export type UserCalendarTarget = {
@@ -187,7 +240,60 @@ const schemaStatements = [
     last_seen_run_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    title TEXT,
+    description TEXT,
+    location TEXT,
+    author TEXT,
+    event_type TEXT,
+    category TEXT,
+    all_day INTEGER NOT NULL DEFAULT 0 CHECK (all_day IN (0, 1)),
+    source_url TEXT,
+    destination_id TEXT,
     PRIMARY KEY (google_user_id, source_key)
+  )`,
+  `CREATE TABLE IF NOT EXISTS sync_run_users (
+    run_id TEXT NOT NULL,
+    google_user_id TEXT NOT NULL,
+    google_email TEXT NOT NULL,
+    display_name TEXT,
+    schoolbox_user_id INTEGER,
+    schoolbox_email TEXT,
+    status TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    events_found INTEGER NOT NULL DEFAULT 0,
+    events_included INTEGER NOT NULL DEFAULT 0,
+    events_created INTEGER NOT NULL DEFAULT 0,
+    events_updated INTEGER NOT NULL DEFAULT 0,
+    events_deleted INTEGER NOT NULL DEFAULT 0,
+    events_unchanged INTEGER NOT NULL DEFAULT 0,
+    managed_events_after INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    PRIMARY KEY (run_id, google_user_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS sync_run_events (
+    run_id TEXT NOT NULL,
+    google_user_id TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    title TEXT,
+    description TEXT,
+    location TEXT,
+    author TEXT,
+    event_type TEXT,
+    category TEXT,
+    source_start TEXT,
+    source_end TEXT,
+    all_day INTEGER NOT NULL DEFAULT 0 CHECK (all_day IN (0, 1)),
+    source_url TEXT,
+    google_event_id TEXT,
+    calendar_id TEXT,
+    destination_id TEXT,
+    action TEXT NOT NULL,
+    detail TEXT,
+    error_message TEXT,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, google_user_id, source_key)
   )`,
   `CREATE TABLE IF NOT EXISTS user_calendar_targets (
     google_user_id TEXT NOT NULL,
@@ -215,6 +321,8 @@ const schemaStatements = [
   )`,
   "CREATE INDEX IF NOT EXISTS event_mappings_seen_idx ON event_mappings (google_user_id, last_seen_run_id)",
   "CREATE INDEX IF NOT EXISTS sync_runs_started_idx ON sync_runs (started_at DESC)",
+  "CREATE INDEX IF NOT EXISTS sync_run_users_status_idx ON sync_run_users (run_id, status, google_email)",
+  "CREATE INDEX IF NOT EXISTS sync_run_events_user_idx ON sync_run_events (run_id, google_user_id, action, source_start)",
 ];
 
 let initialized = false;
@@ -262,6 +370,22 @@ export async function ensureSchema(): Promise<void> {
   if (!eventMappingColumns.some((column) => column.name === "calendar_id")) {
     // Every event created by older Relay versions was placed on the primary calendar.
     binding.prepare("ALTER TABLE event_mappings ADD COLUMN calendar_id TEXT NOT NULL DEFAULT 'primary'").run();
+  }
+  const eventDiagnosticColumns: Array<{ name: string; definition: string }> = [
+    { name: "title", definition: "TEXT" },
+    { name: "description", definition: "TEXT" },
+    { name: "location", definition: "TEXT" },
+    { name: "author", definition: "TEXT" },
+    { name: "event_type", definition: "TEXT" },
+    { name: "category", definition: "TEXT" },
+    { name: "all_day", definition: "INTEGER NOT NULL DEFAULT 0 CHECK (all_day IN (0, 1))" },
+    { name: "source_url", definition: "TEXT" },
+    { name: "destination_id", definition: "TEXT" },
+  ];
+  for (const column of eventDiagnosticColumns) {
+    if (!eventMappingColumns.some((existing) => existing.name === column.name)) {
+      binding.prepare(`ALTER TABLE event_mappings ADD COLUMN ${column.name} ${column.definition}`).run();
+    }
   }
   let userColumns = binding.prepare("PRAGMA table_info(user_mappings)").all<{ name: string }>().results;
   const emailHasGlobalUniqueIndex = binding.prepare("PRAGMA index_list(user_mappings)")
@@ -667,6 +791,11 @@ export async function finishRun(run: RunSummary): Promise<void> {
       run.id,
     )
     .run();
+  // Keep summaries indefinitely but bound sensitive, high-volume drill-down
+  // snapshots to the newest 100 runs (roughly 25 days at a six-hour cadence).
+  const expiredRuns = `SELECT id FROM sync_runs ORDER BY started_at DESC LIMIT -1 OFFSET 100`;
+  db().prepare(`DELETE FROM sync_run_events WHERE run_id IN (${expiredRuns})`).run();
+  db().prepare(`DELETE FROM sync_run_users WHERE run_id IN (${expiredRuns})`).run();
 }
 
 export async function listRuns(limit = 30): Promise<RunSummary[]> {
@@ -680,6 +809,160 @@ export async function listRuns(limit = 30): Promise<RunSummary[]> {
     .bind(Math.max(1, Math.min(limit, 100)))
     .all<RunSummary>();
   return result.results;
+}
+
+export async function getRun(runId: string): Promise<RunSummary | null> {
+  await ensureSchema();
+  return db().prepare(`SELECT id, trigger, status, started_at AS startedAt, completed_at AS completedAt,
+    phase, phase_detail AS phaseDetail, progress_at AS progressAt,
+    users_discovered AS usersDiscovered, users_matched AS usersMatched, users_synced AS usersSynced,
+    events_created AS eventsCreated, events_updated AS eventsUpdated, events_deleted AS eventsDeleted,
+    events_unchanged AS eventsUnchanged, errors, message FROM sync_runs WHERE id = ?`)
+    .bind(runId).first<RunSummary>();
+}
+
+export async function startRunUserDiagnostic(input: Omit<RunUserDiagnostic,
+  "status" | "stage" | "startedAt" | "completedAt" | "eventsFound" | "eventsIncluded" |
+  "eventsCreated" | "eventsUpdated" | "eventsDeleted" | "eventsUnchanged" |
+  "managedEventsAfter" | "errorMessage">): Promise<void> {
+  await ensureSchema();
+  const startedAt = new Date().toISOString();
+  db().prepare(`INSERT INTO sync_run_users
+    (run_id, google_user_id, google_email, display_name, schoolbox_user_id, schoolbox_email,
+     status, stage, started_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'running', 'starting', ?)
+    ON CONFLICT(run_id, google_user_id) DO UPDATE SET
+      google_email=excluded.google_email, display_name=excluded.display_name,
+      schoolbox_user_id=excluded.schoolbox_user_id, schoolbox_email=excluded.schoolbox_email,
+      status='running', stage='starting', started_at=excluded.started_at, completed_at=NULL,
+      events_found=0, events_included=0, events_created=0, events_updated=0,
+      events_deleted=0, events_unchanged=0, managed_events_after=0, error_message=NULL`)
+    .bind(
+      input.runId,
+      input.googleUserId,
+      input.googleEmail,
+      input.displayName,
+      input.schoolboxUserId,
+      input.schoolboxEmail,
+      startedAt,
+    ).run();
+}
+
+export async function finishRunUserDiagnostic(input: Pick<RunUserDiagnostic,
+  "runId" | "googleUserId" | "status" | "stage" | "eventsFound" | "eventsIncluded" |
+  "eventsCreated" | "eventsUpdated" | "eventsDeleted" | "eventsUnchanged" |
+  "managedEventsAfter" | "errorMessage">): Promise<void> {
+  await ensureSchema();
+  db().prepare(`UPDATE sync_run_users SET status = ?, stage = ?, completed_at = ?,
+    events_found = ?, events_included = ?, events_created = ?, events_updated = ?,
+    events_deleted = ?, events_unchanged = ?, managed_events_after = ?, error_message = ?
+    WHERE run_id = ? AND google_user_id = ?`)
+    .bind(
+      input.status,
+      input.stage,
+      new Date().toISOString(),
+      input.eventsFound,
+      input.eventsIncluded,
+      input.eventsCreated,
+      input.eventsUpdated,
+      input.eventsDeleted,
+      input.eventsUnchanged,
+      input.managedEventsAfter,
+      input.errorMessage?.slice(0, 4_000) ?? null,
+      input.runId,
+      input.googleUserId,
+    ).run();
+}
+
+export async function recordRunEventDiagnostic(input: Omit<RunEventDiagnostic, "recordedAt">): Promise<void> {
+  await ensureSchema();
+  db().prepare(`INSERT INTO sync_run_events
+    (run_id, google_user_id, source_key, title, description, location, author, event_type,
+     category, source_start, source_end, all_day, source_url, google_event_id, calendar_id,
+     destination_id, action, detail, error_message, recorded_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(run_id, google_user_id, source_key) DO UPDATE SET
+      title=excluded.title, description=excluded.description, location=excluded.location,
+      author=excluded.author, event_type=excluded.event_type, category=excluded.category,
+      source_start=excluded.source_start, source_end=excluded.source_end, all_day=excluded.all_day,
+      source_url=excluded.source_url, google_event_id=excluded.google_event_id,
+      calendar_id=excluded.calendar_id, destination_id=excluded.destination_id,
+      action=excluded.action, detail=excluded.detail, error_message=excluded.error_message,
+      recorded_at=excluded.recorded_at`)
+    .bind(
+      input.runId,
+      input.googleUserId,
+      input.sourceKey,
+      input.title,
+      input.description,
+      input.location,
+      input.author,
+      input.eventType,
+      input.category,
+      input.sourceStart,
+      input.sourceEnd,
+      Number(input.allDay),
+      input.sourceUrl,
+      input.googleEventId,
+      input.calendarId,
+      input.destinationId,
+      input.action,
+      input.detail?.slice(0, 2_000) ?? null,
+      input.errorMessage?.slice(0, 4_000) ?? null,
+      new Date().toISOString(),
+    ).run();
+}
+
+export async function listRunUserDiagnostics(runId: string): Promise<RunUserDiagnostic[]> {
+  await ensureSchema();
+  return db().prepare(`SELECT run_id AS runId, google_user_id AS googleUserId,
+    google_email AS googleEmail, display_name AS displayName, schoolbox_user_id AS schoolboxUserId,
+    schoolbox_email AS schoolboxEmail, status, stage, started_at AS startedAt,
+    completed_at AS completedAt, events_found AS eventsFound, events_included AS eventsIncluded,
+    events_created AS eventsCreated, events_updated AS eventsUpdated, events_deleted AS eventsDeleted,
+    events_unchanged AS eventsUnchanged, managed_events_after AS managedEventsAfter,
+    error_message AS errorMessage FROM sync_run_users WHERE run_id = ?
+    ORDER BY CASE status WHEN 'failed' THEN 0 WHEN 'running' THEN 1 ELSE 2 END,
+      google_email COLLATE NOCASE`)
+    .bind(runId).all<RunUserDiagnostic>().results;
+}
+
+export async function listRunEventDiagnostics(
+  runId: string,
+  googleUserId: string,
+  options: { limit?: number; offset?: number } = {},
+): Promise<{ events: RunEventDiagnostic[]; total: number }> {
+  await ensureSchema();
+  const limit = Math.max(1, Math.min(options.limit ?? 100, 250));
+  const offset = Math.max(0, options.offset ?? 0);
+  const binding = db();
+  const total = binding.prepare(`SELECT COUNT(*) AS count FROM sync_run_events
+    WHERE run_id = ? AND google_user_id = ?`).bind(runId, googleUserId).first<{ count: number }>()?.count ?? 0;
+  const events = binding.prepare(`SELECT run_id AS runId, google_user_id AS googleUserId,
+    source_key AS sourceKey, title, description, location, author, event_type AS eventType,
+    category, source_start AS sourceStart, source_end AS sourceEnd, all_day AS allDay,
+    source_url AS sourceUrl, google_event_id AS googleEventId, calendar_id AS calendarId,
+    destination_id AS destinationId, action, detail, error_message AS errorMessage,
+    recorded_at AS recordedAt FROM sync_run_events
+    WHERE run_id = ? AND google_user_id = ?
+    ORDER BY CASE action WHEN 'failed' THEN 0 WHEN 'created' THEN 1 WHEN 'updated' THEN 2
+      WHEN 'deleted' THEN 3 ELSE 4 END, source_start, title COLLATE NOCASE LIMIT ? OFFSET ?`)
+    .bind(runId, googleUserId, limit, offset).all<RunEventDiagnostic>().results;
+  for (const event of events) event.allDay = Boolean(event.allDay);
+  return { events, total };
+}
+
+export async function listUserRunDiagnostics(googleUserId: string, limit = 20): Promise<RunUserDiagnostic[]> {
+  await ensureSchema();
+  return db().prepare(`SELECT run_id AS runId, google_user_id AS googleUserId,
+    google_email AS googleEmail, display_name AS displayName, schoolbox_user_id AS schoolboxUserId,
+    schoolbox_email AS schoolboxEmail, status, stage, started_at AS startedAt,
+    completed_at AS completedAt, events_found AS eventsFound, events_included AS eventsIncluded,
+    events_created AS eventsCreated, events_updated AS eventsUpdated, events_deleted AS eventsDeleted,
+    events_unchanged AS eventsUnchanged, managed_events_after AS managedEventsAfter,
+    error_message AS errorMessage FROM sync_run_users WHERE google_user_id = ?
+    ORDER BY started_at DESC LIMIT ?`)
+    .bind(googleUserId, Math.max(1, Math.min(limit, 100))).all<RunUserDiagnostic>().results;
 }
 
 type UserMappingWrite = Omit<UserMapping, "syncEnabled" | "directoryActive" | "calendarCount">;
@@ -846,22 +1129,37 @@ export async function getEventMappings(googleUserId: string): Promise<EventMappi
   await ensureSchema();
   const result = await db()
     .prepare(`SELECT google_user_id AS googleUserId, source_key AS sourceKey, google_event_id AS googleEventId,
-      calendar_id AS calendarId, source_hash AS sourceHash, source_start AS sourceStart, source_end AS sourceEnd, last_seen_run_id AS lastSeenRunId,
-      created_at AS createdAt, updated_at AS updatedAt FROM event_mappings WHERE google_user_id = ?`)
+      calendar_id AS calendarId, source_hash AS sourceHash, source_start AS sourceStart,
+      source_end AS sourceEnd, last_seen_run_id AS lastSeenRunId, created_at AS createdAt,
+      updated_at AS updatedAt, title, description, location, author, event_type AS eventType,
+      category, all_day AS allDay, source_url AS sourceUrl, destination_id AS destinationId
+      FROM event_mappings WHERE google_user_id = ? ORDER BY source_start, title COLLATE NOCASE`)
     .bind(googleUserId)
     .all<EventMapping>();
+  for (const event of result.results) event.allDay = Boolean(event.allDay);
   return result.results;
 }
 
-export async function upsertEventMapping(mapping: Omit<EventMapping, "calendarId"> & { calendarId?: string }): Promise<void> {
+type EventMappingDiagnosticFields = "title" | "description" | "location" | "author" |
+  "eventType" | "category" | "allDay" | "sourceUrl" | "destinationId";
+
+export async function upsertEventMapping(
+  mapping: Omit<EventMapping, "calendarId" | EventMappingDiagnosticFields> &
+    { calendarId?: string } & Partial<Pick<EventMapping, EventMappingDiagnosticFields>>,
+): Promise<void> {
   await ensureSchema();
   await db()
     .prepare(`INSERT INTO event_mappings
-      (google_user_id, source_key, google_event_id, calendar_id, source_hash, source_start, source_end, last_seen_run_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (google_user_id, source_key, google_event_id, calendar_id, source_hash, source_start, source_end,
+       last_seen_run_id, created_at, updated_at, title, description, location, author, event_type,
+       category, all_day, source_url, destination_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(google_user_id, source_key) DO UPDATE SET google_event_id=excluded.google_event_id,
       calendar_id=excluded.calendar_id, source_hash=excluded.source_hash, source_start=excluded.source_start, source_end=excluded.source_end,
-      last_seen_run_id=excluded.last_seen_run_id, updated_at=excluded.updated_at`)
+      last_seen_run_id=excluded.last_seen_run_id, updated_at=excluded.updated_at,
+      title=excluded.title, description=excluded.description, location=excluded.location,
+      author=excluded.author, event_type=excluded.event_type, category=excluded.category,
+      all_day=excluded.all_day, source_url=excluded.source_url, destination_id=excluded.destination_id`)
     .bind(
       mapping.googleUserId,
       mapping.sourceKey,
@@ -873,6 +1171,15 @@ export async function upsertEventMapping(mapping: Omit<EventMapping, "calendarId
       mapping.lastSeenRunId,
       mapping.createdAt,
       mapping.updatedAt,
+      mapping.title ?? null,
+      mapping.description ?? null,
+      mapping.location ?? null,
+      mapping.author ?? null,
+      mapping.eventType ?? null,
+      mapping.category ?? null,
+      Number(mapping.allDay ?? false),
+      mapping.sourceUrl ?? null,
+      mapping.destinationId ?? null,
     )
     .run();
 }
@@ -966,11 +1273,36 @@ export async function upsertUserCalendarTarget(target: UserCalendarTarget): Prom
     .run();
 }
 
-export async function touchEventMapping(googleUserId: string, sourceKey: string, runId: string): Promise<void> {
+export async function touchEventMapping(
+  googleUserId: string,
+  sourceKey: string,
+  runId: string,
+  diagnostic: Partial<Pick<EventMapping, EventMappingDiagnosticFields>> = {},
+): Promise<void> {
   await ensureSchema();
   await db()
-    .prepare("UPDATE event_mappings SET last_seen_run_id = ?, updated_at = ? WHERE google_user_id = ? AND source_key = ?")
-    .bind(runId, new Date().toISOString(), googleUserId, sourceKey)
+    .prepare(`UPDATE event_mappings SET last_seen_run_id = ?, updated_at = ?,
+      title = COALESCE(?, title), description = COALESCE(?, description),
+      location = COALESCE(?, location), author = COALESCE(?, author),
+      event_type = COALESCE(?, event_type), category = COALESCE(?, category),
+      all_day = ?, source_url = COALESCE(?, source_url),
+      destination_id = COALESCE(?, destination_id)
+      WHERE google_user_id = ? AND source_key = ?`)
+    .bind(
+      runId,
+      new Date().toISOString(),
+      diagnostic.title ?? null,
+      diagnostic.description ?? null,
+      diagnostic.location ?? null,
+      diagnostic.author ?? null,
+      diagnostic.eventType ?? null,
+      diagnostic.category ?? null,
+      Number(diagnostic.allDay ?? false),
+      diagnostic.sourceUrl ?? null,
+      diagnostic.destinationId ?? null,
+      googleUserId,
+      sourceKey,
+    )
     .run();
 }
 
