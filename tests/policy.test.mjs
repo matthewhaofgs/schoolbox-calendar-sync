@@ -3,8 +3,10 @@ import test from "node:test";
 
 import {
   DEFAULT_SYNC_POLICY,
+  eventExcludedForUser,
   eventIncludedByPolicy,
   normalizeSyncPolicy,
+  normalizeUserEventExclusions,
   resolveGoogleEventRule,
   withoutManagedCalendarDestination,
 } from "../lib/policy.ts";
@@ -29,6 +31,18 @@ test("sync policy normalizes exact type rules and applies every event filter", (
   assert.equal(eventIncludedByPolicy({ category: "school_event", type: "Other", allDay: false, completed: false }, policy), false);
   assert.equal(eventIncludedByPolicy({ category: "school_event", type: "Excursion", allDay: true, completed: false }, policy), false);
   assert.equal(eventIncludedByPolicy({ category: "school_event", type: "Excursion", allDay: false, completed: true }, policy), false);
+});
+
+test("individual exclusions only remove categories and exact types for one person", () => {
+  const exclusions = normalizeUserEventExclusions({
+    categories: ["timetable", "invalid", "timetable"],
+    eventTypes: [" Junior School Event ", "junior school event", "", "Assembly"],
+  });
+  assert.deepEqual(exclusions.categories, ["timetable"]);
+  assert.deepEqual(exclusions.eventTypes, ["Junior School Event", "Assembly"]);
+  assert.equal(eventExcludedForUser({ category: "timetable", type: "Ordinary lesson" }, exclusions), true);
+  assert.equal(eventExcludedForUser({ category: "school_event", type: "JUNIOR SCHOOL EVENT" }, exclusions), true);
+  assert.equal(eventExcludedForUser({ category: "school_event", type: "Whole School Event" }, exclusions), false);
 });
 
 test("Schoolbox normalization classifies documented calendar sources", () => {

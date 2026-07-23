@@ -88,6 +88,13 @@ test("upgrades preserve sync-all behavior for existing installations and mapping
   assert.equal(mapping.googleUserId, "existing-user");
   assert.equal(mapping.syncEnabled, true);
   assert.equal(mapping.directoryActive, true);
+  assert.equal(mapping.hasCustomExclusions, false);
+  assert.deepEqual(await storage.getUserEventExclusions("existing-user"), {
+    categories: [],
+    eventTypes: [],
+    updatedAt: null,
+    updatedBy: null,
+  });
   assert.equal((await storage.getEventMappings("existing-user"))[0]?.googleEventId, "legacy-event");
   assert.equal((await storage.getEventMappings("existing-user"))[0]?.calendarId, "primary");
 });

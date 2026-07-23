@@ -9,6 +9,7 @@ import {
 } from "./google";
 import { SchoolboxClient, type NormalizedSchoolboxCalendarEvent, type SchoolboxUser } from "./schoolbox";
 import {
+  eventExcludedForUser,
   eventIncludedByPolicy,
   resolveGoogleEventRule,
   withoutManagedCalendarDestination,
@@ -25,6 +26,7 @@ import {
   finishRunUserDiagnostic,
   getConfig,
   getEventMappings,
+  getUserEventExclusions,
   getUserCalendarTarget,
   getUserMapping,
   listCalendarTargetsForDestination,
@@ -469,7 +471,7 @@ async function syncUser(
   });
 
   try {
-    const [events, storedMappings, storedCalendarTargets] = await Promise.all([
+    const [events, storedMappings, storedCalendarTargets, userExclusions] = await Promise.all([
       schoolbox.getCalendarEvents(match.schoolbox.id, {
         pastDays: options.pastDays,
         futureDays: options.futureDays,
@@ -478,6 +480,7 @@ async function syncUser(
       }),
       getEventMappings(googleUserId),
       listUserCalendarTargets(googleUserId),
+      getUserEventExclusions(googleUserId),
     ]);
     counters.eventsFound = events.length;
     stage = "reconciling_calendars";
@@ -494,6 +497,8 @@ async function syncUser(
     const seen = new Set<string>();
     const excluded = new Set<string>();
     const excludedSourceRoots = new Set<string>();
+    const userExcluded = new Set<string>();
+    const userExcludedSourceRoots = new Set<string>();
     const calendarTargets = new Map<string, Promise<string>>();
     await recordDiscoveredEventTypes(events);
     stage = "processing_events";
@@ -526,18 +531,29 @@ async function syncUser(
         activeSourceKey = null;
         continue;
       }
-      if (!eventIncludedByPolicy({
+      const policyEvent = {
         category: event.category ?? "other",
         type: event.type,
         allDay: event.allDay,
         completed: Boolean(event.completed),
-      }, options.syncPolicy)) {
+      };
+      const globallyIncluded = eventIncludedByPolicy(policyEvent, options.syncPolicy);
+      const excludedForUser = globallyIncluded && eventExcludedForUser(policyEvent, userExclusions);
+      if (!globallyIncluded || excludedForUser) {
         excluded.add(sourceKey);
         excludedSourceRoots.add(event.sourceKey);
+        if (excludedForUser) {
+          userExcluded.add(sourceKey);
+          userExcludedSourceRoots.add(event.sourceKey);
+        }
         await recordEvent(event, sourceKey, "excluded", {
           detail: options.syncPolicy.deleteExcludedEvents
-            ? "Excluded by current policy; any tracked Google copy will be removed."
-            : "Excluded by current policy; an existing Google copy is retained by configuration.",
+            ? excludedForUser
+              ? "Excluded by this person's custom settings; any tracked Google copy will be removed."
+              : "Excluded by organisation policy; any tracked Google copy will be removed."
+            : excludedForUser
+              ? "Excluded by this person's custom settings; an existing Google copy is retained by configuration."
+              : "Excluded by organisation policy; an existing Google copy is retained by configuration.",
         });
         activeEvent = null;
         activeSourceKey = null;
@@ -677,6 +693,7 @@ async function syncUser(
       const occurrenceMarker = mapping.sourceKey.lastIndexOf(":occurrence:");
       const mappingRoot = occurrenceMarker >= 0 ? mapping.sourceKey.slice(0, occurrenceMarker) : mapping.sourceKey;
       const excludedByPolicy = excluded.has(mapping.sourceKey) || excludedSourceRoots.has(mappingRoot);
+      const excludedByUser = userExcluded.has(mapping.sourceKey) || userExcludedSourceRoots.has(mappingRoot);
       if (excludedByPolicy ? !options.syncPolicy.deleteExcludedEvents : !options.syncPolicy.deleteMissingEvents) continue;
       const sourceStart = new Date(mapping.sourceStart);
       const sourceEnd = new Date(mapping.sourceEnd);
@@ -717,8 +734,10 @@ async function syncUser(
         calendarId: mapping.calendarId,
         destinationId: mapping.destinationId,
         action: "deleted",
-        detail: excludedByPolicy
-          ? "The managed Google event was deleted because the source is excluded by policy."
+        detail: excludedByUser
+          ? "The managed Google event was deleted because it is excluded for this person."
+          : excludedByPolicy
+            ? "The managed Google event was deleted because the source is excluded by organisation policy."
           : "The managed Google event was deleted because it was no longer returned by Schoolbox.",
         errorMessage: null,
       });

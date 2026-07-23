@@ -5,9 +5,12 @@ import {
   eventTypeKey,
   normalizeEventTypeLabel,
   normalizeSyncPolicy,
+  normalizeUserEventExclusions,
   type EventCategory,
   type SyncPolicy,
   type SyncPolicyInput,
+  type UserEventExclusions,
+  type UserEventExclusionsInput,
 } from "./policy";
 import { decryptSecret, encryptSecret, HttpError } from "./security";
 
@@ -79,6 +82,7 @@ export type UserMapping = {
   lastError: string | null;
   eventCount: number;
   calendarCount: number;
+  hasCustomExclusions: boolean;
   syncEnabled: boolean;
   directoryActive: boolean;
   updatedAt: string;
@@ -311,6 +315,13 @@ const schemaStatements = [
     label TEXT NOT NULL,
     category TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS user_event_exclusions (
+    google_user_id TEXT PRIMARY KEY,
+    excluded_categories_json TEXT NOT NULL DEFAULT '[]',
+    excluded_event_types_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -673,6 +684,73 @@ export async function listDiscoveredEventTypes(): Promise<DiscoveredEventType[]>
     FROM event_type_catalog ORDER BY label COLLATE NOCASE`).all<DiscoveredEventType>().results;
 }
 
+export async function getUserEventExclusions(googleUserId: string): Promise<UserEventExclusions> {
+  await ensureSchema();
+  const row = db().prepare(`SELECT excluded_categories_json AS categoriesJson,
+    excluded_event_types_json AS eventTypesJson, updated_at AS updatedAt, updated_by AS updatedBy
+    FROM user_event_exclusions WHERE google_user_id = ?`)
+    .bind(googleUserId)
+    .first<{ categoriesJson: string; eventTypesJson: string; updatedAt: string; updatedBy: string }>();
+  if (!row) return normalizeUserEventExclusions(null);
+  try {
+    return normalizeUserEventExclusions({
+      categories: JSON.parse(row.categoriesJson),
+      eventTypes: JSON.parse(row.eventTypesJson),
+    }, row);
+  } catch {
+    return normalizeUserEventExclusions(null, row);
+  }
+}
+
+export async function saveUserEventExclusions(
+  googleUserId: string,
+  input: UserEventExclusionsInput,
+  actor: string,
+): Promise<UserEventExclusions> {
+  await ensureSchema();
+  const id = googleUserId.trim();
+  if (!id || id.length > 200) throw new HttpError(400, "Choose a valid user");
+  const binding = db();
+  const user = binding.prepare(`SELECT schoolbox_user_id AS schoolboxUserId FROM user_mappings
+    WHERE google_user_id = ? AND directory_active = 1`)
+    .bind(id)
+    .first<{ schoolboxUserId: number | null }>();
+  if (!user) throw new HttpError(404, "User not found");
+  if (user.schoolboxUserId === null) {
+    throw new HttpError(409, "Event exclusions can only be configured after a Schoolbox identity is matched");
+  }
+
+  const now = new Date().toISOString();
+  const normalized = normalizeUserEventExclusions(input, { updatedAt: now, updatedBy: actor });
+  binding.transaction(() => {
+    if (normalized.categories.length === 0 && normalized.eventTypes.length === 0) {
+      binding.prepare("DELETE FROM user_event_exclusions WHERE google_user_id = ?").bind(id).run();
+    } else {
+      binding.prepare(`INSERT INTO user_event_exclusions
+        (google_user_id, excluded_categories_json, excluded_event_types_json, updated_at, updated_by)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(google_user_id) DO UPDATE SET
+          excluded_categories_json = excluded.excluded_categories_json,
+          excluded_event_types_json = excluded.excluded_event_types_json,
+          updated_at = excluded.updated_at,
+          updated_by = excluded.updated_by`)
+        .bind(id, JSON.stringify(normalized.categories), JSON.stringify(normalized.eventTypes), now, actor)
+        .run();
+    }
+    binding.prepare(`INSERT INTO audit_log (occurred_at, actor, action, detail)
+      VALUES (?, ?, 'user.event_exclusions_updated', ?)`)
+      .bind(
+        now,
+        actor,
+        `${id}: ${normalized.categories.length} category exclusion(s), ${normalized.eventTypes.length} exact type exclusion(s)`,
+      )
+      .run();
+  });
+  return normalized.categories.length === 0 && normalized.eventTypes.length === 0
+    ? normalizeUserEventExclusions(null)
+    : normalized;
+}
+
 export async function addAudit(actor: string, action: string, detail?: string): Promise<void> {
   await ensureSchema();
   await db()
@@ -969,7 +1047,7 @@ export async function listUserRunDiagnostics(googleUserId: string, limit = 20): 
     .bind(googleUserId, Math.max(1, Math.min(limit, 100))).all<RunUserDiagnostic>().results;
 }
 
-type UserMappingWrite = Omit<UserMapping, "syncEnabled" | "directoryActive" | "calendarCount">;
+type UserMappingWrite = Omit<UserMapping, "syncEnabled" | "directoryActive" | "calendarCount" | "hasCustomExclusions">;
 
 export async function upsertUserMapping(mapping: UserMappingWrite): Promise<void> {
   await ensureSchema();
@@ -1105,6 +1183,7 @@ export async function listUserMappings(limit?: number, includeInactive = false):
       u.last_error AS lastError,
       (SELECT COUNT(*) FROM event_mappings e WHERE e.google_user_id = u.google_user_id) AS eventCount,
       (SELECT COUNT(*) FROM user_calendar_targets c WHERE c.google_user_id = u.google_user_id) AS calendarCount,
+      EXISTS(SELECT 1 FROM user_event_exclusions x WHERE x.google_user_id = u.google_user_id) AS hasCustomExclusions,
       u.sync_enabled AS syncEnabled, u.directory_active AS directoryActive, u.updated_at AS updatedAt
       FROM user_mappings u${includeInactive ? "" : " WHERE u.directory_active = 1"}
       ORDER BY u.google_email${limit === undefined ? "" : " LIMIT ?"}`);
@@ -1112,6 +1191,7 @@ export async function listUserMappings(limit?: number, includeInactive = false):
     ? statement.all<UserMapping>()
     : statement.bind(Math.max(1, Math.min(limit, 5000))).all<UserMapping>();
   for (const mapping of result.results) {
+    mapping.hasCustomExclusions = Boolean(mapping.hasCustomExclusions);
     mapping.syncEnabled = Boolean(mapping.syncEnabled);
     mapping.directoryActive = Boolean(mapping.directoryActive);
   }
@@ -1126,11 +1206,13 @@ export async function getUserMapping(googleUserId: string): Promise<UserMapping 
       u.last_error AS lastError,
       (SELECT COUNT(*) FROM event_mappings e WHERE e.google_user_id = u.google_user_id) AS eventCount,
       (SELECT COUNT(*) FROM user_calendar_targets c WHERE c.google_user_id = u.google_user_id) AS calendarCount,
+      EXISTS(SELECT 1 FROM user_event_exclusions x WHERE x.google_user_id = u.google_user_id) AS hasCustomExclusions,
       u.sync_enabled AS syncEnabled, u.directory_active AS directoryActive, u.updated_at AS updatedAt
       FROM user_mappings u WHERE u.google_user_id = ? AND u.directory_active = 1`)
     .bind(googleUserId)
     .first<UserMapping>();
   if (mapping) {
+    mapping.hasCustomExclusions = Boolean(mapping.hasCustomExclusions);
     mapping.syncEnabled = Boolean(mapping.syncEnabled);
     mapping.directoryActive = Boolean(mapping.directoryActive);
   }

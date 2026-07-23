@@ -5,6 +5,7 @@ import {
   DEFAULT_SYNC_POLICY,
   EVENT_CATEGORIES,
   eventTypeKey,
+  normalizeEventTypeLabel,
   normalizeSyncPolicy,
   resolveGoogleEventRule,
   withoutManagedCalendarDestination,
@@ -13,6 +14,7 @@ import {
   type GoogleEventRuleOverride,
   type ManagedCalendarDefinition,
   type SyncPolicy,
+  type UserEventExclusions,
 } from "@/lib/policy";
 
 type View = "dashboard" | "setup" | "people" | "runs" | "settings" | "access";
@@ -64,6 +66,7 @@ type Person = {
   googleEmail: string;
   role: string;
   status: "Synced" | "Syncing" | "Pending" | "Unmatched" | "Error";
+  hasCustomExclusions: boolean;
   syncEnabled: boolean;
   eventCount: number;
   calendarCount: number;
@@ -159,6 +162,17 @@ type UserDetailPayload = {
   events: DiagnosticEvent[];
   calendars: UserCalendarDetail[];
   runs: RunUserDiagnostic[];
+  exclusions: UserEventExclusions;
+  eventTypes: DiscoveredEventType[];
+  globalPolicy: SyncPolicy;
+};
+
+const EVENT_CATEGORY_COPY: Record<EventCategory, [string, string]> = {
+  timetable: ["Timetable lessons", "Classes and lessons identified by Schoolbox timetable metadata."],
+  resource_booking: ["Resource bookings", "Rooms, equipment and other resource-linked bookings."],
+  school_event: ["School events", "Items explicitly labelled as school-wide events."],
+  individual_event: ["Individual events", "Personal or individual calendar items."],
+  other: ["Other and custom", "Unclassified or installation-specific sources."],
 };
 
 const SCOPES = [
@@ -188,6 +202,7 @@ function normalisePeople(value: unknown): Person[] | null {
       googleEmail: String(row.googleEmail ?? row.targetEmail ?? row.email ?? "—"),
       role: String(row.role ?? "User"),
       status,
+      hasCustomExclusions: Boolean(row.hasCustomExclusions),
       syncEnabled: status !== "Unmatched" && (row.syncEnabled === undefined ? true : Boolean(row.syncEnabled)),
       eventCount: Math.max(0, Number(row.eventCount ?? 0)),
       calendarCount: Math.max(0, Number(row.calendarCount ?? 0)),
@@ -977,7 +992,6 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
   const [userDetail, setUserDetail] = useState<UserDetailPayload | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
-  const [diagnosticPersonId, setDiagnosticPersonId] = useState("");
   const [page, setPage] = useState(0);
   const pageSize = 100;
   const selectAllRef = useRef<HTMLInputElement>(null);
@@ -1102,36 +1116,198 @@ function PeoplePage({ people, setPeople, counts, loadError, canConfigure, setNot
     <section className="people-summary"><div><span className="summary-icon green">#</span><p><b>{people.length || counts?.users || 0}</b><small>Discovered</small></p></div><div><span className="summary-icon green">✓</span><p><b>{enabledCount}</b><small>Enabled</small></p></div><div><span className="summary-icon amber">Ⅱ</span><p><b>{pausedCount}</b><small>Paused</small></p></div><div><span className="summary-icon blue">○</span><p><b>{people.length ? people.filter(p => p.status === "Unmatched").length : counts?.unmatched ?? 0}</b><small>Unmatched</small></p></div></section>
     <section className="panel people-panel" aria-busy={busy}><div className="people-tools"><div className="search-box"><span aria-hidden="true">⌕</span><input value={query} onChange={e => { setQuery(e.target.value); setPage(0); setSelected(new Set()); }} placeholder="Search people or email…" aria-label="Search people" /></div><select value={coverageFilter} onChange={e => { setCoverageFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter calendar sync coverage"><option>All coverage</option><option>Enabled</option><option>Paused</option></select><select value={statusFilter} onChange={e => { setStatusFilter(e.target.value); setPage(0); setSelected(new Set()); }} aria-label="Filter sync status"><option>All statuses</option><option>Synced</option><option>Syncing</option><option>Pending</option><option>Unmatched</option><option>Error</option></select><button className="button ghost" onClick={exportCsv}>Export CSV</button></div>
       {canConfigure && selectedVisible > 0 && <div className="people-bulk" role="status"><b>{selectedVisible} selected</b><span>Bulk changes apply only to the selected visible users.</span><button className="button secondary" onClick={() => void updateCoverage(selectedIds, true)} disabled={busy}>Enable selected</button><button className="button ghost" onClick={() => void updateCoverage(selectedIds, false)} disabled={busy}>Pause selected</button></div>}
-      <div className="coverage-note"><span>i</span><p><b>Detailed diagnostics are available to authenticated IT staff.</b> Choose a person below to inspect identities, errors, calendars, managed events, and recent run outcomes.</p></div>
-      <div className="diagnostic-picker"><div><b>Person and event diagnostics</b><small>Search or filter the table, then choose any visible person.</small></div><select value={diagnosticPersonId} onChange={event => setDiagnosticPersonId(event.target.value)} aria-label="Choose a person for diagnostics"><option value="">Choose a person…</option>{visible.map(person => <option key={person.id} value={person.id}>{person.name} — {person.googleEmail}</option>)}</select><button className="button secondary" disabled={!diagnosticPersonId} onClick={() => { const person = people.find(candidate => candidate.id === diagnosticPersonId); if (person) void openPersonDetail(person); }}>View details</button></div>
-      <div className="table-wrap"><table className="people-table"><caption className="sr-only">Discovered Google Workspace users and their Schoolbox calendar sync coverage</caption><thead><tr>{canConfigure && <th scope="col" className="selection-column"><input ref={selectAllRef} type="checkbox" checked={selectableVisible.length > 0 && selectedVisible === selectableVisible.length} onChange={event => selectVisible(event.target.checked)} aria-label="Select visible matched users" disabled={busy || selectableVisible.length === 0} /></th>}<th scope="col">Person</th><th scope="col">Schoolbox identity</th><th scope="col">Google Workspace</th><th scope="col">Role</th><th scope="col">Calendar sync</th><th scope="col">Relay data</th><th scope="col">Status</th><th scope="col">Last sync</th></tr></thead><tbody>{visible.map(person => <tr key={person.id}>{canConfigure && <td className="selection-column"><input type="checkbox" checked={person.status !== "Unmatched" && selected.has(person.id)} onChange={event => selectOne(person.id, event.target.checked)} aria-label={person.status === "Unmatched" ? `${person.name} cannot be selected until matched` : `Select ${person.name}`} disabled={busy || person.status === "Unmatched"} /></td>}<th scope="row" className="person-row-header"><div className="person-cell"><span className="person-avatar">{person.name.split(" ").map(part => part[0]).join("").slice(0, 2)}</span><div><b>{person.name}</b><small>{person.id}</small></div></div></th><td>{person.schoolboxEmail}</td><td className={person.googleEmail === "—" ? "muted" : ""}>{person.googleEmail}</td><td>{person.role}</td><td>{person.status === "Unmatched" ? <span className="coverage-state unavailable" title="A Schoolbox identity must be discovered before calendar sync can be enabled">Unavailable</span> : canConfigure ? <label className="sync-switch"><input type="checkbox" checked={person.syncEnabled} onChange={event => void updateCoverage([person.id], event.target.checked)} disabled={busy} aria-label={`Sync calendar for ${person.name}`} /><span aria-hidden="true" /><b>{person.syncEnabled ? "Enabled" : "Paused"}</b></label> : <span className={`coverage-state ${person.syncEnabled ? "enabled" : "paused"}`}>{person.syncEnabled ? "Enabled" : "Paused"}</span>}</td><td><div className="managed-events-cell"><span><b>{person.eventCount}</b> event(s)</span><span><b>{person.calendarCount}</b> calendar(s)</span>{canConfigure && <button type="button" onClick={() => void cleanupManagedEvents(person)} disabled={busy || person.eventCount === 0} title={person.eventCount === 0 ? "No Relay-managed events to remove" : "Pause this user and remove only Relay-managed events"}>Remove Relay events</button>}{canConfigure && person.calendarCount > 0 && <button type="button" onClick={() => void cleanupManagedEvents(person, true)} disabled={busy} title="Pause this user, remove Relay-managed events, and delete Relay-created secondary calendars">Delete Relay calendars</button>}</div></td><td><StatusPill status={person.status} /></td><td>{person.lastSync}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state"><b>{loadError ? "People could not be loaded" : people.length === 0 ? "No people discovered yet" : "No people found"}</b><p>{loadError ? "Refresh after checking the server connection and logs." : people.length === 0 ? "Complete setup and run a sync to discover Workspace users. If the new-user default is paused, discovery will not write calendar events." : "Try different search or filter options."}</p></div>}</div>
+      <div className="coverage-note"><span>i</span><p><b>Select a person’s name for detailed settings and diagnostics.</b> Individual event exclusions live in the person drawer, keeping this overview focused on sync coverage.</p></div>
+      <div className="table-wrap">
+        <table className="people-table">
+          <caption className="sr-only">Discovered Google Workspace users and their Schoolbox calendar sync coverage</caption>
+          <thead><tr>
+            {canConfigure && <th scope="col" className="selection-column"><input ref={selectAllRef} type="checkbox" checked={selectableVisible.length > 0 && selectedVisible === selectableVisible.length} onChange={event => selectVisible(event.target.checked)} aria-label="Select visible matched users" disabled={busy || selectableVisible.length === 0} /></th>}
+            <th scope="col">Person</th><th scope="col">Schoolbox identity</th><th scope="col">Google Workspace</th><th scope="col">Role</th><th scope="col">Calendar sync</th><th scope="col">Relay data</th><th scope="col">Status</th><th scope="col">Last sync</th>
+          </tr></thead>
+          <tbody>{visible.map(person => <tr key={person.id}>
+            {canConfigure && <td className="selection-column"><input type="checkbox" checked={person.status !== "Unmatched" && selected.has(person.id)} onChange={event => selectOne(person.id, event.target.checked)} aria-label={person.status === "Unmatched" ? `${person.name} cannot be selected until matched` : `Select ${person.name}`} disabled={busy || person.status === "Unmatched"} /></td>}
+            <th scope="row" className="person-row-header"><div className="person-cell"><span className="person-avatar">{person.name.split(" ").map(part => part[0]).join("").slice(0, 2)}</span><div><button type="button" className="person-link" onClick={() => void openPersonDetail(person)}>{person.name}</button><small>{person.id}</small></div></div></th>
+            <td>{person.schoolboxEmail}</td>
+            <td className={person.googleEmail === "—" ? "muted" : ""}>{person.googleEmail}</td>
+            <td>{person.role}</td>
+            <td>{person.status === "Unmatched" ? <span className="coverage-state unavailable" title="A Schoolbox identity must be discovered before calendar sync can be enabled">Unavailable</span> : canConfigure ? <label className="sync-switch"><input type="checkbox" checked={person.syncEnabled} onChange={event => void updateCoverage([person.id], event.target.checked)} disabled={busy} aria-label={`Sync calendar for ${person.name}`} /><span aria-hidden="true" /><b>{person.syncEnabled ? "Enabled" : "Paused"}</b></label> : <span className={`coverage-state ${person.syncEnabled ? "enabled" : "paused"}`}>{person.syncEnabled ? "Enabled" : "Paused"}</span>}</td>
+            <td><div className="managed-events-cell"><span><b>{person.eventCount}</b> event(s)</span><span><b>{person.calendarCount}</b> calendar(s)</span>{person.hasCustomExclusions && <span className="custom-policy-marker">Custom exclusions</span>}{canConfigure && <button type="button" onClick={() => void cleanupManagedEvents(person)} disabled={busy || person.eventCount === 0} title={person.eventCount === 0 ? "No Relay-managed events to remove" : "Pause this user and remove only Relay-managed events"}>Remove Relay events</button>}{canConfigure && person.calendarCount > 0 && <button type="button" onClick={() => void cleanupManagedEvents(person, true)} disabled={busy} title="Pause this user, remove Relay-managed events, and delete Relay-created secondary calendars">Delete Relay calendars</button>}</div></td>
+            <td><StatusPill status={person.status} /></td><td>{person.lastSync}</td>
+          </tr>)}</tbody>
+        </table>
+        {filtered.length === 0 && <div className="empty-state"><b>{loadError ? "People could not be loaded" : people.length === 0 ? "No people discovered yet" : "No people found"}</b><p>{loadError ? "Refresh after checking the server connection and logs." : people.length === 0 ? "Complete setup and run a sync to discover Workspace users. If the new-user default is paused, discovery will not write calendar events." : "Try different search or filter options."}</p></div>}
+      </div>
       <div className="table-footer"><span>{filtered.length ? `Showing ${pageIndex * pageSize + 1}–${Math.min((pageIndex + 1) * pageSize, filtered.length)} of ${filtered.length} matching people` : `0 of ${people.length} people`}</span><div><button onClick={() => { setPage(Math.max(0, pageIndex - 1)); setSelected(new Set()); }} disabled={pageIndex === 0}>Previous</button><span>Page {pageIndex + 1} of {pageCount}</span><button onClick={() => { setPage(Math.min(pageCount - 1, pageIndex + 1)); setSelected(new Set()); }} disabled={pageIndex >= pageCount - 1}>Next</button></div></div>
     </section>
-    {selectedPerson && <UserDiagnosticsDrawer person={selectedPerson} detail={userDetail} loading={detailLoading} error={detailError} onClose={() => setSelectedPerson(null)} onRetry={() => void openPersonDetail(selectedPerson)} />}
+    {selectedPerson && <UserDiagnosticsDrawer
+      person={selectedPerson}
+      detail={userDetail}
+      loading={detailLoading}
+      error={detailError}
+      canConfigure={canConfigure}
+      onClose={() => setSelectedPerson(null)}
+      onRetry={() => void openPersonDetail(selectedPerson)}
+      onPreferencesSaved={exclusions => {
+        setUserDetail(current => current ? { ...current, exclusions } : current);
+        setPeople(current => current.map(candidate => candidate.id === selectedPerson.id
+          ? { ...candidate, hasCustomExclusions: exclusions.categories.length + exclusions.eventTypes.length > 0 }
+          : candidate));
+        setNotice({ kind: "success", message: "Individual event exclusions saved. They apply on this person’s next enabled sync." });
+      }}
+    />}
   </>;
 }
 
-function UserDiagnosticsDrawer({ person, detail, loading, error, onClose, onRetry }: {
+function UserExclusionEditor({ person, detail, canConfigure, onSaved }: {
+  person: Person;
+  detail: UserDetailPayload;
+  canConfigure: boolean;
+  onSaved: (exclusions: UserEventExclusions) => void;
+}) {
+  const [categories, setCategories] = useState<EventCategory[]>(detail.exclusions.categories);
+  const [eventTypes, setEventTypes] = useState<string[]>(detail.exclusions.eventTypes);
+  const [query, setQuery] = useState("");
+  const [manualType, setManualType] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+
+  useEffect(() => {
+    setCategories(detail.exclusions.categories);
+    setEventTypes(detail.exclusions.eventTypes);
+    setQuery("");
+    setManualType("");
+    setSaveError("");
+  }, [person.id, detail.exclusions.updatedAt, detail.exclusions.categories, detail.exclusions.eventTypes]);
+
+  const catalog = useMemo(() => {
+    const entries = new Map(detail.eventTypes.map(entry => [entry.key, entry]));
+    for (const label of eventTypes) {
+      const key = eventTypeKey(label);
+      if (key && !entries.has(key)) entries.set(key, {
+        key,
+        label,
+        category: "other",
+        lastSeenAt: "",
+      });
+    }
+    return [...entries.values()].sort((a, b) => a.label.localeCompare(b.label, "en-AU"));
+  }, [detail.eventTypes, eventTypes]);
+  const excludedTypeKeys = new Set(eventTypes.map(eventTypeKey));
+  const visibleTypes = catalog.filter(entry =>
+    `${entry.label} ${EVENT_CATEGORY_COPY[entry.category][0]}`.toLocaleLowerCase("en-AU")
+      .includes(query.trim().toLocaleLowerCase("en-AU")),
+  );
+  const savedCategories = [...detail.exclusions.categories].sort().join("|");
+  const draftCategories = [...categories].sort().join("|");
+  const savedTypes = detail.exclusions.eventTypes.map(eventTypeKey).sort().join("|");
+  const draftTypes = eventTypes.map(eventTypeKey).sort().join("|");
+  const dirty = savedCategories !== draftCategories || savedTypes !== draftTypes;
+  const exclusionCount = categories.length + eventTypes.length;
+
+  const globalTypeCoverage = (entry: DiscoveredEventType) => {
+    if (!entry.lastSeenAt) return "Saved exclusion · type not currently detected";
+    const override = detail.globalPolicy.eventTypeOverrides[entry.key];
+    if (override?.enabled === true) return "Included globally by exact rule";
+    if (override?.enabled === false) return "Already excluded globally";
+    if (!detail.globalPolicy.categories[entry.category]) return "Already excluded globally by category";
+    if (detail.globalPolicy.eventTypeMode === "all") return "Type included globally";
+    const listed = detail.globalPolicy.eventTypes.some(type => eventTypeKey(type) === entry.key);
+    if (detail.globalPolicy.eventTypeMode === "include") return listed ? "Type included globally" : "Already excluded globally";
+    return listed ? "Already excluded globally" : "Type included globally";
+  };
+  const toggleCategory = (category: EventCategory, excluded: boolean) => {
+    setCategories(current => excluded
+      ? [...new Set([...current, category])]
+      : current.filter(candidate => candidate !== category));
+  };
+  const toggleType = (label: string, excluded: boolean) => {
+    const key = eventTypeKey(label);
+    setEventTypes(current => excluded
+      ? current.some(candidate => eventTypeKey(candidate) === key) ? current : [...current, label]
+      : current.filter(candidate => eventTypeKey(candidate) !== key));
+  };
+  const addManualType = (event: FormEvent) => {
+    event.preventDefault();
+    const label = normalizeEventTypeLabel(manualType);
+    if (!label) return;
+    toggleType(label, true);
+    setManualType("");
+    setQuery(label);
+  };
+  const save = async () => {
+    if (!dirty || saving) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      const payload = await fetchJson("/api/user-details", {
+        method: "PATCH",
+        body: JSON.stringify({
+          userId: person.id,
+          excludedCategories: categories,
+          excludedEventTypes: eventTypes,
+        }),
+      });
+      onSaved(payload.exclusions as UserEventExclusions);
+    } catch (saveFailure) {
+      setSaveError(saveFailure instanceof Error ? saveFailure.message : "Individual exclusions could not be saved.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <div className="user-exclusion-editor">
+    <div className="user-exclusion-intro"><span>−</span><div><b>Only remove events for this person</b><p>Organisation event rules remain the baseline. These settings can exclude more events, but cannot re-enable anything disabled globally.</p></div></div>
+    <div className="user-exclusion-summary"><b>{exclusionCount}</b><span>individual exclusion{exclusionCount === 1 ? "" : "s"}</span><small>{detail.exclusions.updatedAt ? `Last saved ${diagnosticDate(detail.exclusions.updatedAt)}` : "Using organisation defaults"}</small></div>
+
+    <h3>Category exclusions</h3>
+    <div className="user-category-exclusions">{EVENT_CATEGORIES.map(category => <label key={category}>
+      <input type="checkbox" checked={categories.includes(category)} onChange={event => toggleCategory(category, event.target.checked)} disabled={!canConfigure || saving} />
+      <span><b>{EVENT_CATEGORY_COPY[category][0]}</b><small>{detail.globalPolicy.categories[category] ? "Category baseline is included globally" : "Category baseline is excluded globally"}</small></span>
+    </label>)}</div>
+
+    <div className="user-type-heading"><div><h3>Exact Schoolbox type exclusions</h3><p>Use an exact type when this person still needs other events from the same category.</p></div>{canConfigure && <input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search detected types…" aria-label="Search detected Schoolbox event types" />}</div>
+    <div className="user-type-exclusions">
+      {visibleTypes.map(entry => <label key={entry.key}>
+        <input type="checkbox" checked={excludedTypeKeys.has(entry.key)} onChange={event => toggleType(entry.label, event.target.checked)} disabled={!canConfigure || saving} />
+        <span><b>{entry.label}</b><small>{EVENT_CATEGORY_COPY[entry.category][0]} · {categories.includes(entry.category) ? "Covered by category exclusion" : globalTypeCoverage(entry)}</small></span>
+      </label>)}
+      {visibleTypes.length === 0 && <div className="diagnostic-empty">No detected event types match this search.</div>}
+    </div>
+    {canConfigure && <form className="manual-type-exclusion" onSubmit={addManualType}><Field label="Exclude an exact type not yet detected" hint="The label must exactly match the Schoolbox event type."><input maxLength={120} value={manualType} onChange={event => setManualType(event.target.value)} placeholder="Exact Schoolbox type label" /></Field><button className="button ghost" type="submit" disabled={!manualType.trim() || saving}>Add exclusion</button></form>}
+
+    {saveError && <div className="diagnostic-error-box"><b>Could not save exclusions</b><p>{saveError}</p></div>}
+    {canConfigure && <div className="user-exclusion-actions"><div><b>{dirty ? "Unsaved changes" : "Saved"}</b><small>Changes apply on this person’s next enabled sync. Existing Relay events follow the organisation’s reconciliation setting.</small></div><button className="button ghost" type="button" onClick={() => { setCategories([]); setEventTypes([]); }} disabled={saving || exclusionCount === 0}>Clear all</button><button className="button primary" type="button" onClick={() => void save()} disabled={saving || !dirty}>{saving ? "Saving…" : "Save exclusions"}</button></div>}
+  </div>;
+}
+
+function UserDiagnosticsDrawer({ person, detail, loading, error, canConfigure, onClose, onRetry, onPreferencesSaved }: {
   person: Person;
   detail: UserDetailPayload | null;
   loading: boolean;
   error: string;
+  canConfigure: boolean;
   onClose: () => void;
   onRetry: () => void;
+  onPreferencesSaved: (exclusions: UserEventExclusions) => void;
 }) {
+  const [section, setSection] = useState<"overview" | "exclusions">("overview");
+  useEffect(() => setSection("overview"), [person.id]);
   return <div className="detail-backdrop" role="presentation" onMouseDown={onClose}><aside className="admin-detail-drawer" role="dialog" aria-modal="true" aria-label={`Diagnostics for ${person.name}`} onMouseDown={event => event.stopPropagation()}>
     <div className="drawer-head"><div><p className="eyebrow">Person diagnostics</p><h2>{person.name}</h2><small>{person.googleEmail}</small></div><button onClick={onClose} aria-label="Close person diagnostics">×</button></div>
     {loading && <div className="diagnostic-empty">Loading identities, calendars, events, and run history…</div>}
     {error && <div className="diagnostic-error-box"><b>Diagnostics unavailable</b><p>{error}</p><button className="button secondary" onClick={onRetry}>Try again</button></div>}
     {detail && <>
       <div className="drawer-summary"><span><small>Status</small><b>{person.status}</b></span><span><small>Coverage</small><b>{person.status === "Unmatched" ? "Unavailable" : person.syncEnabled ? "Enabled" : "Paused"}</b></span><span><small>Schoolbox ID</small><b>{String(detail.user.schoolboxUserId ?? "Unmatched")}</b></span><span><small>Managed data</small><b>{detail.events.length} event(s), {detail.calendars.length} calendar(s)</b></span></div>
-      <h3>Identities</h3><dl className="diagnostic-grid"><div><dt>Google Workspace</dt><dd>{person.googleEmail}</dd></div><div><dt>Schoolbox</dt><dd>{person.schoolboxEmail}</dd></div><div><dt>Google user ID</dt><dd><code>{person.id}</code></dd></div><div><dt>Role</dt><dd>{person.role}</dd></div></dl>
-      {typeof detail.user.lastError === "string" && detail.user.lastError && <div className="diagnostic-error-box"><b>Latest user error</b><p>{detail.user.lastError}</p></div>}
-      <h3>Relay-created calendars</h3>
-      {detail.calendars.length ? <div className="diagnostic-calendars">{detail.calendars.map(calendar => <details key={calendar.destinationId}><summary><b>{calendar.summary}</b><span>{calendar.destinationId}</span></summary><dl className="diagnostic-grid"><div><dt>Google calendar ID</dt><dd><code>{calendar.googleCalendarId}</code></dd></div><div><dt>Time zone</dt><dd>{calendar.timeZone}</dd></div><div><dt>Description</dt><dd>{calendar.description || "None"}</dd></div><div><dt>Updated</dt><dd>{diagnosticDate(calendar.updatedAt)}</dd></div></dl></details>)}</div> : <div className="diagnostic-empty">No Relay-created secondary calendars are recorded.</div>}
-      <h3>Current managed events</h3><DiagnosticEventList events={detail.events} empty="No managed events are currently recorded for this person." />
-      <h3>Recent run outcomes</h3>
-      {detail.runs.length ? <div className="diagnostic-run-list">{detail.runs.map(outcome => <div className={outcome.status === "failed" ? "failed" : ""} key={outcome.runId}><b>{outcome.status} · {diagnosticDate(outcome.completedAt || outcome.startedAt)}</b><small>{outcome.eventsFound} found · {outcome.eventsCreated} created · {outcome.eventsUpdated} updated · {outcome.eventsDeleted} deleted · {outcome.eventsUnchanged} unchanged</small>{outcome.errorMessage && <p>{outcome.errorMessage}</p>}</div>)}</div> : <div className="diagnostic-empty">Detailed per-run history starts with the next run on the enhanced diagnostic schema.</div>}
+      <div className="person-detail-tabs"><button className={section === "overview" ? "active" : ""} onClick={() => setSection("overview")}>Overview and diagnostics</button>{person.status !== "Unmatched" && <button className={section === "exclusions" ? "active" : ""} onClick={() => setSection("exclusions")}>Event exclusions{detail.exclusions.categories.length + detail.exclusions.eventTypes.length > 0 ? ` (${detail.exclusions.categories.length + detail.exclusions.eventTypes.length})` : ""}</button>}</div>
+      {section === "overview" ? <>
+        <h3>Identities</h3><dl className="diagnostic-grid"><div><dt>Google Workspace</dt><dd>{person.googleEmail}</dd></div><div><dt>Schoolbox</dt><dd>{person.schoolboxEmail}</dd></div><div><dt>Google user ID</dt><dd><code>{person.id}</code></dd></div><div><dt>Role</dt><dd>{person.role}</dd></div></dl>
+        {typeof detail.user.lastError === "string" && detail.user.lastError && <div className="diagnostic-error-box"><b>Latest user error</b><p>{detail.user.lastError}</p></div>}
+        <h3>Relay-created calendars</h3>
+        {detail.calendars.length ? <div className="diagnostic-calendars">{detail.calendars.map(calendar => <details key={calendar.destinationId}><summary><b>{calendar.summary}</b><span>{calendar.destinationId}</span></summary><dl className="diagnostic-grid"><div><dt>Google calendar ID</dt><dd><code>{calendar.googleCalendarId}</code></dd></div><div><dt>Time zone</dt><dd>{calendar.timeZone}</dd></div><div><dt>Description</dt><dd>{calendar.description || "None"}</dd></div><div><dt>Updated</dt><dd>{diagnosticDate(calendar.updatedAt)}</dd></div></dl></details>)}</div> : <div className="diagnostic-empty">No Relay-created secondary calendars are recorded.</div>}
+        <h3>Current managed events</h3><DiagnosticEventList events={detail.events} empty="No managed events are currently recorded for this person." />
+        <h3>Recent run outcomes</h3>
+        {detail.runs.length ? <div className="diagnostic-run-list">{detail.runs.map(outcome => <div className={outcome.status === "failed" ? "failed" : ""} key={outcome.runId}><b>{outcome.status} · {diagnosticDate(outcome.completedAt || outcome.startedAt)}</b><small>{outcome.eventsFound} found · {outcome.eventsCreated} created · {outcome.eventsUpdated} updated · {outcome.eventsDeleted} deleted · {outcome.eventsUnchanged} unchanged</small>{outcome.errorMessage && <p>{outcome.errorMessage}</p>}</div>)}</div> : <div className="diagnostic-empty">Detailed per-run history starts with the next run on the enhanced diagnostic schema.</div>}
+      </> : <UserExclusionEditor person={person} detail={detail} canConfigure={canConfigure} onSaved={onPreferencesSaved} />}
     </>}
   </aside></div>;
 }
@@ -1382,13 +1558,7 @@ function SettingsPage({ config, setConfig, saveConfig, setNotice }: {
     }
     void saveConfig();
   };
-  const categoryCopy: Record<EventCategory, [string, string]> = {
-    timetable: ["Timetable lessons", "Classes and lessons identified by Schoolbox timetable metadata."],
-    resource_booking: ["Resource bookings", "Rooms, equipment and other resource-linked bookings."],
-    school_event: ["School events", "Items explicitly labelled as school-wide events."],
-    individual_event: ["Individual events", "Personal or individual calendar items."],
-    other: ["Other and custom", "Unclassified or installation-specific sources. Keep enabled unless exact type rules replace it."],
-  };
+  const categoryCopy = EVENT_CATEGORY_COPY;
   const destinationName = (destinationId: string) => destinationId === "primary"
     ? "Primary calendar"
     : config.syncPolicy.secondaryCalendars.find(calendar => calendar.id === destinationId)?.name ?? "Unknown destination";

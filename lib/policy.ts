@@ -74,6 +74,25 @@ export type SyncPolicyInput = Partial<Omit<SyncPolicy, "categories">> & {
   categories?: Partial<Record<EventCategory, boolean>>;
 };
 
+export type UserEventExclusions = {
+  categories: EventCategory[];
+  eventTypes: string[];
+  updatedAt: string | null;
+  updatedBy: string | null;
+};
+
+export type UserEventExclusionsInput = {
+  categories?: unknown;
+  eventTypes?: unknown;
+};
+
+export const EMPTY_USER_EVENT_EXCLUSIONS: UserEventExclusions = {
+  categories: [],
+  eventTypes: [],
+  updatedAt: null,
+  updatedBy: null,
+};
+
 export const DEFAULT_SYNC_POLICY: SyncPolicy = {
   categories: {
     timetable: true,
@@ -127,6 +146,44 @@ export function normalizeEventTypeLabel(value: unknown): string {
 
 export function eventTypeKey(value: unknown): string {
   return normalizeEventTypeLabel(value).toLocaleLowerCase("en-AU");
+}
+
+export function normalizeUserEventExclusions(
+  input: UserEventExclusionsInput | null | undefined,
+  metadata: Pick<UserEventExclusions, "updatedAt" | "updatedBy"> = EMPTY_USER_EVENT_EXCLUSIONS,
+): UserEventExclusions {
+  const categories = Array.isArray(input?.categories)
+    ? [...new Set(input.categories.filter((value): value is EventCategory =>
+      typeof value === "string" && EVENT_CATEGORIES.includes(value as EventCategory),
+    ))]
+    : [];
+  const eventTypes: string[] = [];
+  const seenTypes = new Set<string>();
+  if (Array.isArray(input?.eventTypes)) {
+    for (const candidate of input.eventTypes) {
+      const label = normalizeEventTypeLabel(candidate);
+      const key = eventTypeKey(label);
+      if (!key || seenTypes.has(key)) continue;
+      seenTypes.add(key);
+      eventTypes.push(label);
+      if (eventTypes.length >= 200) break;
+    }
+  }
+  return {
+    categories,
+    eventTypes,
+    updatedAt: metadata.updatedAt ?? null,
+    updatedBy: metadata.updatedBy ?? null,
+  };
+}
+
+export function eventExcludedForUser(
+  event: Pick<PolicyEvent, "category" | "type">,
+  exclusions: Pick<UserEventExclusions, "categories" | "eventTypes">,
+): boolean {
+  if (exclusions.categories.includes(event.category)) return true;
+  const eventKey = eventTypeKey(event.type);
+  return Boolean(eventKey && exclusions.eventTypes.some((type) => eventTypeKey(type) === eventKey));
 }
 
 function normalizedCalendarDefinitions(value: unknown, fallback: ManagedCalendarDefinition[]): ManagedCalendarDefinition[] {

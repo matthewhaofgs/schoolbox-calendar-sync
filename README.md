@@ -53,6 +53,7 @@ Relay supports one application replica per SQLite database. The Node server list
 
 - Google Directory discovery with Schoolbox primary and alternate email matching
 - Per-user enable and pause controls with bulk selection
+- Per-user category and exact event-type exclusions layered beneath organisation policy
 - Timetable, resource booking, school event, individual event, and custom event support
 - Timed, all-day, and completed-item filters
 - Global, category, and exact Schoolbox event-type rules
