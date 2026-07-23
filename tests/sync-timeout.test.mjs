@@ -80,6 +80,20 @@ test("the whole-run limit settles even when an injected dependency ignores cance
 });
 
 test("one stalled user becomes a user error while the organization run completes", async () => {
+  const now = new Date().toISOString();
+  await storage.upsertEventMapping({
+    googleUserId: "google-pilot",
+    sourceKey: "existing-managed-event",
+    googleEventId: "google-event-1",
+    calendarId: "primary",
+    sourceHash: "existing-hash",
+    sourceStart: "2026-07-23T09:00:00.000Z",
+    sourceEnd: "2026-07-23T09:30:00.000Z",
+    lastSeenRunId: "earlier-run",
+    createdAt: now,
+    updatedAt: now,
+  });
+
   const run = await runFullSync("test", "test:runner", {
     schoolbox: {
       async getAllUsers() {
@@ -108,10 +122,12 @@ test("one stalled user becomes a user error while the organization run completes
   const mapping = await storage.getUserMapping("google-pilot");
   assert.equal(mapping?.status, "error");
   assert.match(mapping?.lastError ?? "", /User calendar synchronization timed out/);
+  assert.equal(mapping?.eventCount, 1, "partial progress should preserve the actual managed event count");
   const outcomes = await storage.listRunUserDiagnostics(run.id);
   assert.equal(outcomes.length, 1);
   assert.equal(outcomes[0].status, "failed");
   assert.equal(outcomes[0].stage, "fetching_events");
+  assert.equal(outcomes[0].managedEventsAfter, 1);
   assert.match(outcomes[0].errorMessage ?? "", /User calendar synchronization timed out/);
 });
 

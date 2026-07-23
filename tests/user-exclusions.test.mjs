@@ -42,6 +42,8 @@ const sourceEvents = [
   { sourceKey: "whole", title: "Whole school event", description: "", location: null, start: "2026-07-22T09:00:00+10:00", end: "2026-07-22T10:00:00+10:00", allDay: false, type: "Whole School Event", category: "school_event", completed: false },
 ];
 const calls = { inserted: [], deleted: [] };
+let activeDeletes = 0;
+let peakDeletes = 0;
 const clients = {
   schoolbox: {
     async getAllUsers() { return schoolboxUsers; },
@@ -51,7 +53,16 @@ const clients = {
     async listAllUsers() { return googleUsers; },
     async insertEvent(email, event) { calls.inserted.push({ email, title: event.summary }); },
     async updateEvent() {},
-    async deleteEvent(email, eventId) { calls.deleted.push({ email, eventId }); },
+    async deleteEvent(email, eventId) {
+      activeDeletes += 1;
+      peakDeletes = Math.max(peakDeletes, activeDeletes);
+      try {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        calls.deleted.push({ email, eventId });
+      } finally {
+        activeDeletes -= 1;
+      }
+    },
   },
 };
 
@@ -76,6 +87,7 @@ test("per-user category and exact-type exclusions reconcile only that person's m
   assert.equal((await storage.getEventMappings("google-custom")).length, 1);
   assert.equal((await storage.getEventMappings("google-defaults")).length, 3);
   assert.ok(calls.deleted.every(call => call.email === "custom@example.edu"), "another person's managed events must not be touched");
+  assert.equal(peakDeletes, 2, "independent managed-event removals should run concurrently");
 
   const diagnostics = await storage.listRunEventDiagnostics(restricted.id, "google-custom");
   const excluded = diagnostics.events.filter(event => event.action === "deleted");
