@@ -9,6 +9,7 @@ import {
   listDiscoveredEventTypes,
   listUserCalendarTargets,
   listUserRunDiagnostics,
+  normalizeTargetProvider,
   saveUserEventExclusions,
 } from "@/lib/storage";
 
@@ -21,20 +22,23 @@ const privateJson = (body: unknown) => Response.json(body, {
 export async function GET(request: Request) {
   try {
     await requestActor(request, "view");
-    const userId = new URL(request.url).searchParams.get("userId")?.trim();
+    const params = new URL(request.url).searchParams;
+    const target = normalizeTargetProvider(params.get("target") ?? "google");
+    const userId = params.get("userId")?.trim();
     if (!userId || userId.length > 200) throw new HttpError(400, "Choose a valid user");
-    const user = await getUserMapping(userId);
+    const user = await getUserMapping(userId, target);
     if (!user) throw new HttpError(404, "User not found");
 
     const [events, calendars, runs, exclusions, eventTypes, config] = await Promise.all([
-      getEventMappings(userId),
-      listUserCalendarTargets(userId),
-      listUserRunDiagnostics(userId, 20),
-      getUserEventExclusions(userId),
+      getEventMappings(userId, target),
+      listUserCalendarTargets(userId, target),
+      listUserRunDiagnostics(userId, 20, target),
+      getUserEventExclusions(userId, target),
       listDiscoveredEventTypes(),
       getConfig(false),
     ]);
-    return privateJson({ user, events, calendars, runs, exclusions, eventTypes, globalPolicy: config.syncPolicy });
+    return privateJson({ target, user, events, calendars, runs, exclusions, eventTypes,
+      globalPolicy: target === "google" ? config.syncPolicy : config.microsoftSyncPolicy });
   } catch (error) {
     return jsonError(error);
   }
@@ -45,9 +49,11 @@ export async function PATCH(request: Request) {
     const actor = await requestActor(request, "configure");
     const body = await request.json() as {
       userId?: unknown;
+      target?: unknown;
       excludedCategories?: unknown;
       excludedEventTypes?: unknown;
     };
+    const target = normalizeTargetProvider(body.target ?? "google");
     if (typeof body.userId !== "string" || !body.userId.trim()) throw new HttpError(400, "Choose a user");
     if (!Array.isArray(body.excludedCategories) ||
       !body.excludedCategories.every((value) => typeof value === "string" && EVENT_CATEGORIES.includes(value as EventCategory))) {
@@ -61,8 +67,8 @@ export async function PATCH(request: Request) {
     const exclusions = await saveUserEventExclusions(body.userId, {
       categories: body.excludedCategories,
       eventTypes: body.excludedEventTypes,
-    }, actor);
-    return privateJson({ exclusions });
+    }, actor, target);
+    return privateJson({ target, exclusions });
   } catch (error) {
     return jsonError(error);
   }

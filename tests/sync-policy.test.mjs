@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { completeStoredSetup } from "./setup-fixtures.mjs";
 
 const temporary = mkdtempSync(join(tmpdir(), "relay-sync-policy-"));
 process.env.DATABASE_PATH = join(temporary, "relay.sqlite");
@@ -27,11 +28,17 @@ await storage.saveConfig({
   syncNewUsersByDefault: false,
   syncPolicy: { eventTypeMode: "include", eventTypes: ["Timetable"] },
 }, "test:setup");
+await completeStoredSetup(storage);
 
 const calls = { inserted: [], updated: [], deleted: [] };
+const eventDay = new Date(Date.now() + 24 * 60 * 60_000);
+const lessonStart = new Date(eventDay); lessonStart.setUTCHours(1, 0, 0, 0);
+const lessonEnd = new Date(lessonStart.getTime() + 60 * 60_000);
+const excursionStart = new Date(eventDay); excursionStart.setUTCDate(excursionStart.getUTCDate() + 1); excursionStart.setUTCHours(1, 0, 0, 0);
+const excursionEnd = new Date(excursionStart.getTime() + 6 * 60 * 60_000);
 const sourceEvents = [
-  { sourceKey: "lesson", title: "Lesson", description: "", location: null, start: "2026-07-14T09:00:00+10:00", end: "2026-07-14T10:00:00+10:00", allDay: false, type: "Timetable", category: "timetable", completed: false },
-  { sourceKey: "excursion", title: "Excursion", description: "", location: null, start: "2026-07-15T09:00:00+10:00", end: "2026-07-15T15:00:00+10:00", allDay: false, type: "Excursion", category: "school_event", completed: false },
+  { sourceKey: "lesson", title: "Lesson", description: "", location: null, start: lessonStart.toISOString(), end: lessonEnd.toISOString(), allDay: false, type: "Timetable", category: "timetable", completed: false },
+  { sourceKey: "excursion", title: "Excursion", description: "", location: null, start: excursionStart.toISOString(), end: excursionEnd.toISOString(), allDay: false, type: "Excursion", category: "school_event", completed: false },
 ];
 const clients = {
   schoolbox: {

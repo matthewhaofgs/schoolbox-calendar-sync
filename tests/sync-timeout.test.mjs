@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { completeStoredSetup } from "./setup-fixtures.mjs";
 
 const temporary = mkdtempSync(join(tmpdir(), "relay-sync-timeout-"));
 process.env.DATABASE_PATH = join(temporary, "relay.sqlite");
@@ -26,6 +27,7 @@ await storage.saveConfig({
   }),
   syncNewUsersByDefault: true,
 }, "test:setup");
+await completeStoredSetup(storage);
 
 function abortAwareNever(signal) {
   return new Promise((_resolve, reject) => {

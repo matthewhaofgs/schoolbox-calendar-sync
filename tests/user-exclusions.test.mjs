@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { completeStoredSetup } from "./setup-fixtures.mjs";
 
 const temporary = mkdtempSync(join(tmpdir(), "relay-user-exclusions-"));
 process.env.DATABASE_PATH = join(temporary, "relay.sqlite");
@@ -27,6 +28,7 @@ await storage.saveConfig({
   syncNewUsersByDefault: false,
   syncPolicy: { eventTypeMode: "all", deleteExcludedEvents: true },
 }, "test:setup");
+await completeStoredSetup(storage);
 
 const schoolboxUsers = [
   { id: 101, email: "custom@example.edu", fullName: "Custom Preferences", enabled: true },

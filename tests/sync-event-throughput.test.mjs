@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { completeStoredSetup } from "./setup-fixtures.mjs";
 
 const temporary = mkdtempSync(join(tmpdir(), "relay-sync-event-throughput-"));
 process.env.DATABASE_PATH = join(temporary, "relay.sqlite");
@@ -27,6 +28,7 @@ await storage.saveConfig({
   syncNewUsersByDefault: false,
   syncPolicy: { eventTypeMode: "all", deleteExcludedEvents: true },
 }, "test:setup");
+await completeStoredSetup(storage);
 
 const sourceEvents = Array.from({ length: 18 }, (_, index) => ({
   sourceKey: `lesson-${index}`,

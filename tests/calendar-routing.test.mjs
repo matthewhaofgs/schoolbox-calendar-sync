@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { completeStoredSetup } from "./setup-fixtures.mjs";
 
 const temporary = mkdtempSync(join(tmpdir(), "relay-calendar-routing-"));
 process.env.DATABASE_PATH = join(temporary, "relay.sqlite");
@@ -32,6 +33,7 @@ await storage.saveConfig({
     },
   },
 }, "test:setup");
+await completeStoredSetup(storage);
 
 const calls = { calendarsCreated: [], calendarsUpdated: [], calendarsDeleted: [], inserted: [], updated: [], deleted: [] };
 const clients = {

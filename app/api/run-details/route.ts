@@ -3,7 +3,9 @@ import { HttpError, jsonError } from "@/lib/security";
 import {
   getRun,
   listRunEventDiagnostics,
+  listRunTargets,
   listRunUserDiagnostics,
+  normalizeTargetProvider,
 } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
@@ -27,13 +29,14 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const runId = url.searchParams.get("runId")?.trim();
     const userId = url.searchParams.get("userId")?.trim();
+    const target = normalizeTargetProvider(url.searchParams.get("target") ?? "google");
     if (!runId || runId.length > 200) throw new HttpError(400, "Choose a valid run");
 
     const run = await getRun(runId);
     if (!run) throw new HttpError(404, "Run not found");
-    const users = await listRunUserDiagnostics(runId);
-    if (!userId) return privateJson({ run, users });
-    if (userId.length > 200 || !users.some((user) => user.googleUserId === userId)) {
+    const [users, targets] = await Promise.all([listRunUserDiagnostics(runId), listRunTargets(runId)]);
+    if (!userId) return privateJson({ run, targets, users });
+    if (userId.length > 200 || !users.some((user) => user.target === target && user.targetUserId === userId)) {
       throw new HttpError(404, "This user has no detailed outcome for the selected run");
     }
 
@@ -41,9 +44,10 @@ export async function GET(request: Request) {
     const offset = boundedInteger(url.searchParams.get("offset"), 0, 0, 1_000_000);
     return privateJson({
       run,
+      targets,
       users,
-      selectedUser: users.find((user) => user.googleUserId === userId),
-      ...(await listRunEventDiagnostics(runId, userId, { limit, offset })),
+      selectedUser: users.find((user) => user.target === target && user.targetUserId === userId),
+      ...(await listRunEventDiagnostics(runId, userId, { limit, offset }, target)),
       limit,
       offset,
     });

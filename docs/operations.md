@@ -23,6 +23,28 @@ docker compose ps
 curl http://127.0.0.1:3000/api/health
 ```
 
+## Microsoft 365 client-secret rotation
+
+Rotate the single-tenant Entra application credential before its configured expiry date. Consent is attached to the application and does not normally need to be granted again when only the secret changes.
+
+1. Create a new client secret for the existing Entra application. Leave the old secret active during validation.
+2. In **Settings > Connections**, enter and save the new secret. Relay automatically pauses the Microsoft target and clears its prior verification marker when target credentials change.
+3. Run the Microsoft 365 connection diagnostic with a known licensed pilot mailbox. A successful probe records the replacement credential as verified; re-enable the target and run a Microsoft-only pilot sync.
+4. After both checks succeed, delete the old client secret in Entra.
+
+If the application client ID, tenant ID, redirect URI, or Graph application permissions change, update the Relay connection and repeat the interactive admin-consent flow. The exact redirect URI remains `${APP_ORIGIN}/api/auth/microsoft/admin-consent/callback`.
+
+## Connection reconfiguration
+
+Use the provider-specific guides under **Connections** for connection changes. Schoolbox, Google Workspace, and Microsoft 365 have independent saved, verified, and completed states. A connection change invalidates and pauses only the affected calendar target; it does not rewrite the other provider's credentials or completion state.
+
+The safe sequence for a changed target is:
+
+1. Open that target's connection guide and save the replacement values.
+2. Run the guide's connection diagnostic against the saved version.
+3. Complete the target guide and choose whether to activate delivery.
+4. Run a target-only pilot sync before widening user coverage.
+
 ## Backup
 
 The SQLite database and `.env.production` form one recovery set. A consistent backup requires Relay to be stopped while the volume is archived.

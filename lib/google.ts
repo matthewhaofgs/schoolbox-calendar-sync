@@ -232,6 +232,8 @@ export interface ListGoogleCalendarEventsOptions {
 export interface GoogleConnectionTestOptions {
   /** A super admin, used as the delegated subject for Directory API access. */
   adminSubject: string;
+  /** Workspace customer to verify. Defaults to `my_customer`. */
+  customer?: string;
   /** User whose primary calendar should be checked. Defaults to a listed user. */
   targetUserEmail?: string;
   signal?: AbortSignal;
@@ -1274,7 +1276,7 @@ export class GoogleWorkspaceClient {
         : adminSubjectOrOptions;
     const page = await this.listUsersPage(
       options.adminSubject,
-      { maxResultsPerPage: 1, signal: options.signal },
+      { customer: options.customer, maxResultsPerPage: 1, signal: options.signal },
       undefined,
     );
     const sampleUsers = page.users ?? [];

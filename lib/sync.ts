@@ -9,6 +9,12 @@ import {
 } from "./google";
 import { SchoolboxClient, type NormalizedSchoolboxCalendarEvent, type SchoolboxUser } from "./schoolbox";
 import {
+  MicrosoftGraphClient,
+  MicrosoftGraphError,
+  type MicrosoftEventInput,
+  type MicrosoftGraphUser,
+} from "./microsoft";
+import {
   eventExcludedForUser,
   eventIncludedByPolicy,
   resolveGoogleEventRule,
@@ -18,11 +24,13 @@ import {
 import {
   addAudit,
   checkpointRun,
+  checkpointRunTarget,
   createRun,
   deleteCalendarTargetRecords,
   deleteEventMapping,
   discoverUserMappings,
   finishRun,
+  finishRunTarget,
   finishRunUserDiagnostic,
   getConfig,
   getEventMappings,
@@ -30,6 +38,7 @@ import {
   getUserCalendarTarget,
   getUserMapping,
   listCalendarTargetsForDestination,
+  listRunUserDiagnostics,
   listUserCalendarTargets,
   listRuns,
   recordManagedEventCleanup,
@@ -38,6 +47,7 @@ import {
   recordDiscoveredEventTypes,
   saveConfig,
   setUsersSyncEnabled,
+  startRunTarget,
   startRunUserDiagnostic,
   touchRunHeartbeat,
   touchEventMapping,
@@ -46,20 +56,29 @@ import {
   upsertUserMapping,
   type EventMapping,
   type RunSummary,
+  type RunTargetSummary,
+  type TargetProvider,
   type UserCalendarTarget,
 } from "./storage";
 import { HttpError } from "./security";
 
 type MatchedUser = { google: GoogleDirectoryUser; schoolbox: SchoolboxUser; schoolboxEmail: string };
+type MicrosoftMatchedUser = { microsoft: MicrosoftGraphUser; schoolbox: SchoolboxUser; schoolboxEmail: string };
 type SchoolboxSyncClient = Pick<SchoolboxClient, "getAllUsers" | "getCalendarEvents">;
 type GoogleSyncClient = Pick<GoogleWorkspaceClient, "listAllUsers" | "createCalendar" | "updateCalendar" | "insertEvent" | "updateEvent" | "deleteEvent">;
 type GoogleCleanupClient = Pick<GoogleWorkspaceClient, "deleteEvent"> & Partial<Pick<GoogleWorkspaceClient, "deleteCalendar">>;
 type GoogleCalendarRetirementClient = Pick<GoogleWorkspaceClient, "deleteCalendar">;
+type MicrosoftCalendarRetirementClient = Pick<MicrosoftGraphClient, "deleteCalendar">;
+type CalendarRetirementClient = GoogleCalendarRetirementClient | MicrosoftCalendarRetirementClient;
+type MicrosoftSyncClient = Pick<MicrosoftGraphClient, "listAllUsers" | "createCalendar" | "updateCalendar" | "insertEvent" | "updateEvent" | "deleteEvent">;
+type MicrosoftCleanupClient = Pick<MicrosoftGraphClient, "deleteEvent"> & Partial<Pick<MicrosoftGraphClient, "deleteCalendar">>;
+type TargetCleanupClient = GoogleCleanupClient | MicrosoftCleanupClient;
 
 /** Optional client overrides used by deterministic integration tests. */
 export type SyncClientOverrides = {
   schoolbox?: SchoolboxSyncClient;
   google?: GoogleSyncClient;
+  microsoft?: MicrosoftSyncClient;
 };
 
 /** Millisecond overrides used only by deterministic timeout tests. */
@@ -162,6 +181,15 @@ async function withHardDeadline<T>(
 
 function syncErrorMessage(error: unknown, signal?: AbortSignal): string {
   if (signal?.aborted) return abortError(signal, "Calendar synchronization was aborted").message;
+  if (error instanceof MicrosoftGraphError) {
+    const diagnostics = [
+      `Graph code ${error.code}`,
+      error.requestId ? `request ${error.requestId}` : null,
+      error.date ? `at ${error.date}` : null,
+      error.retryAfterMs !== undefined ? `retry after ${Math.ceil(error.retryAfterMs / 1_000)}s` : null,
+    ].filter(Boolean).join(", ");
+    return `${error.message}${diagnostics ? ` (${diagnostics})` : ""}`;
+  }
   return error instanceof Error ? error.message : "Unknown synchronization error";
 }
 
@@ -231,6 +259,104 @@ function isSchoolboxActive(user: SchoolboxUser): boolean {
 function isGoogleActive(user: GoogleDirectoryUser): boolean {
   const record = user as GoogleDirectoryUser & { suspended?: boolean; archived?: boolean };
   return !record.suspended && !record.archived;
+}
+
+function microsoftEmail(user: MicrosoftGraphUser): string {
+  return normalizedEmail(user.mail || user.userPrincipalName);
+}
+
+function googleMatchEmails(user: GoogleDirectoryUser): string[] {
+  return [...new Set([
+    user.primaryEmail,
+    ...(user.aliases ?? []),
+    ...(user.nonEditableAliases ?? []),
+  ].map(normalizedEmail).filter(Boolean))];
+}
+
+function microsoftMatchEmails(user: MicrosoftGraphUser): string[] {
+  return [...new Set([
+    user.mail ?? "",
+    user.userPrincipalName ?? "",
+    ...(user.proxyAddresses ?? []).map((address) => address.replace(/^smtp:/i, "")),
+  ].map(normalizedEmail).filter(Boolean))];
+}
+
+function directorySchoolboxMatch(
+  emails: string[],
+  schoolboxByEmail: Map<string, SchoolboxUser>,
+): { schoolbox: SchoolboxUser; matchedEmail: string } | null {
+  for (const email of emails) {
+    const schoolbox = schoolboxByEmail.get(email);
+    if (schoolbox) return { schoolbox, matchedEmail: email };
+  }
+  return null;
+}
+
+function microsoftDisplayName(user: MicrosoftGraphUser): string {
+  return user.displayName?.trim() || microsoftEmail(user);
+}
+
+function isMicrosoftActive(user: MicrosoftGraphUser): boolean {
+  return user.accountEnabled !== false && user.userType?.toLowerCase() !== "guest" && Boolean(microsoftEmail(user));
+}
+
+function uuidFromHex(hex: string): string {
+  const value = hex.slice(0, 32).padEnd(32, "0").split("");
+  value[12] = "4";
+  value[16] = ["8", "9", "a", "b"][Number.parseInt(value[16] ?? "0", 16) % 4];
+  const joined = value.join("");
+  return `${joined.slice(0, 8)}-${joined.slice(8, 12)}-${joined.slice(12, 16)}-${joined.slice(16, 20)}-${joined.slice(20, 32)}`;
+}
+
+function microsoftWallClock(value: string, timezone: string): string {
+  const trimmed = value.trim();
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(trimmed)) return trimmed.replace(/\.\d{1,7}$/, "");
+  const date = new Date(trimmed);
+  if (!Number.isFinite(date.getTime())) return trimmed;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const valueFor = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
+  return `${valueFor("year")}-${valueFor("month")}-${valueFor("day")}T${valueFor("hour")}:${valueFor("minute")}:${valueFor("second")}`;
+}
+
+export async function microsoftEventBody(
+  event: NormalizedSchoolboxCalendarEvent,
+  microsoftUserId: string,
+  timezone: string,
+  sourceKey: string,
+  policy: SyncPolicy,
+  destinationId = "primary",
+): Promise<MicrosoftEventInput> {
+  const rule = resolveGoogleEventRule({ category: event.category ?? "other", type: event.type }, policy);
+  const descriptionParts = [
+    policy.includeDescription ? event.description : undefined,
+    policy.includeEventTypeInDescription && event.type ? `Schoolbox type: ${event.type}` : undefined,
+    policy.includeAuthorInDescription && event.author ? `Schoolbox author: ${event.author}` : undefined,
+    policy.includeSchoolboxLink && event.sourceUrl ? `Schoolbox: ${event.sourceUrl}` : undefined,
+  ].filter(Boolean);
+  const transactionHash = await createContentHash({ provider: "microsoft", microsoftUserId, sourceKey, destinationId });
+  const body: MicrosoftEventInput = {
+    subject: `${policy.titlePrefix ? `${policy.titlePrefix} ` : ""}${event.title || "Schoolbox event"}`,
+    body: { contentType: "text", content: descriptionParts.join("\n\n") },
+    start: { dateTime: event.allDay ? `${event.start.slice(0, 10)}T00:00:00` : microsoftWallClock(event.start, timezone), timeZone: timezone },
+    end: { dateTime: event.allDay ? `${event.end.slice(0, 10)}T00:00:00` : microsoftWallClock(event.end, timezone), timeZone: timezone },
+    isAllDay: event.allDay,
+    location: policy.includeLocation && event.location ? { displayName: event.location } : undefined,
+    showAs: rule.transparency === "transparent" ? "free" : "busy",
+    sensitivity: rule.visibility === "private" ? "private" : rule.visibility === "public" ? "normal" : "normal",
+    isReminderOn: rule.reminderMode === "calendar_default" ? undefined : rule.reminderMode === "custom",
+    reminderMinutesBeforeStart: rule.reminderMode === "custom" ? rule.reminderMinutes : undefined,
+    transactionId: uuidFromHex(transactionHash),
+  };
+  return body;
 }
 
 export async function eventBody(
@@ -309,6 +435,295 @@ async function processInPool<T>(
 // for one user. Keep enough parallelism to complete real reconciliation work
 // inside the user deadline without allowing an unbounded API burst.
 const USER_EVENT_OPERATION_CONCURRENCY = 6;
+const MICROSOFT_EVENT_OPERATION_CONCURRENCY = 4;
+// Increment this when Relay's Microsoft mutation semantics change. Including
+// the revision in the stored source hash gives already-managed events one
+// reconciliation pass instead of leaving values omitted by an older PATCH
+// (and therefore preserved by Graph) in place indefinitely.
+const MICROSOFT_EVENT_RECONCILIATION_VERSION = 2;
+
+function microsoftEventPatchBody(body: MicrosoftEventInput): MicrosoftEventInput {
+  const patch = { ...body };
+  delete patch.transactionId;
+  if (body.location) patch.location = body.location;
+  else {
+    delete patch.location;
+    patch.locations = body.locations ?? [];
+  }
+  return patch;
+}
+
+async function microsoftReplacementEventBody(
+  body: MicrosoftEventInput,
+  replacedEventId: string,
+): Promise<MicrosoftEventInput> {
+  const replacementHash = await createContentHash({
+    provider: "microsoft",
+    transactionId: body.transactionId ?? null,
+    replaces: replacedEventId,
+  });
+  return { ...body, transactionId: uuidFromHex(replacementHash) };
+}
+
+async function resolveMicrosoftCalendarId(options: {
+  destinationId: string;
+  userId: string;
+  timezone: string;
+  policy: SyncPolicy;
+  microsoft: MicrosoftSyncClient;
+  signal?: AbortSignal;
+}): Promise<string> {
+  throwIfAborted(options.signal);
+  if (options.destinationId === "primary") return "primary";
+  const definition = options.policy.secondaryCalendars.find((calendar) => calendar.id === options.destinationId);
+  if (!definition) throw new Error(`Calendar destination ${options.destinationId} is no longer configured.`);
+  const existing = await getUserCalendarTarget(options.userId, definition.id, "microsoft");
+  const now = new Date().toISOString();
+  if (existing) {
+    if (existing.summary !== definition.name || existing.description !== definition.description) {
+      await options.microsoft.updateCalendar(options.userId, existing.targetCalendarId, { name: definition.name }, { signal: options.signal });
+      await upsertUserCalendarTarget({ ...existing, summary: definition.name, description: definition.description, updatedAt: now });
+    }
+    return existing.targetCalendarId;
+  }
+  const created = await options.microsoft.createCalendar(options.userId, { name: definition.name }, { signal: options.signal });
+  const calendarId = created.id?.trim();
+  if (!calendarId) throw new Error("Microsoft created a secondary calendar without returning its identifier.");
+  await upsertUserCalendarTarget({
+    target: "microsoft",
+    targetUserId: options.userId,
+    targetCalendarId: calendarId,
+    googleUserId: options.userId,
+    googleCalendarId: calendarId,
+    destinationId: definition.id,
+    summary: definition.name,
+    description: definition.description,
+    timeZone: options.timezone,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return calendarId;
+}
+
+async function reconcileMicrosoftCalendars(options: {
+  targets: UserCalendarTarget[];
+  userId: string;
+  policy: SyncPolicy;
+  microsoft: MicrosoftSyncClient;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const configured = new Map(options.policy.secondaryCalendars.map((calendar) => [calendar.id, calendar]));
+  for (const target of options.targets) {
+    const definition = configured.get(target.destinationId);
+    if (!definition || (target.summary === definition.name && target.description === definition.description)) continue;
+    throwIfAborted(options.signal);
+    await options.microsoft.updateCalendar(options.userId, target.targetCalendarId, { name: definition.name }, { signal: options.signal });
+    await upsertUserCalendarTarget({ ...target, summary: definition.name, description: definition.description, updatedAt: new Date().toISOString() });
+  }
+}
+
+async function syncMicrosoftUser(
+  match: MicrosoftMatchedUser,
+  run: RunSummary,
+  targetRun: RunTargetSummary,
+  schoolbox: SchoolboxSyncClient,
+  microsoft: MicrosoftSyncClient,
+  options: { pastDays: number; futureDays: number; timezone: string; syncPolicy: SyncPolicy; signal?: AbortSignal },
+): Promise<void> {
+  const target: TargetProvider = "microsoft";
+  const userId = match.microsoft.id;
+  const email = microsoftEmail(match.microsoft);
+  const now = new Date();
+  const windowStart = new Date(now.getTime() - options.pastDays * 86_400_000);
+  const windowEnd = new Date(now.getTime() + options.futureDays * 86_400_000);
+  const baseMapping = {
+    target,
+    targetUserId: userId,
+    targetEmail: email,
+    schoolboxUserId: match.schoolbox.id,
+    schoolboxEmail: match.schoolboxEmail,
+    displayName: microsoftDisplayName(match.microsoft) || schoolboxDisplayName(match.schoolbox),
+    role: schoolboxRole(match.schoolbox),
+    updatedAt: new Date().toISOString(),
+  };
+  const counters = { eventsFound: 0, eventsIncluded: 0, eventsCreated: 0, eventsUpdated: 0, eventsDeleted: 0, eventsUnchanged: 0, managedEventsAfter: 0 };
+  let stage = "fetching_events";
+  await startRunUserDiagnostic({ runId: run.id, target, targetUserId: userId, targetEmail: email,
+    displayName: baseMapping.displayName, schoolboxUserId: match.schoolbox.id, schoolboxEmail: match.schoolboxEmail });
+
+  const recordEvent = (event: NormalizedSchoolboxCalendarEvent, sourceKey: string, action: string, diagnostic: {
+    detail?: string | null; errorMessage?: string | null; targetEventId?: string | null;
+    calendarId?: string | null; destinationId?: string | null;
+  } = {}) => recordRunEventDiagnostic({
+    runId: run.id, target, targetUserId: userId, sourceKey, title: event.title,
+    description: event.description, location: event.location, author: event.author,
+    eventType: event.type, category: event.category ?? "other", sourceStart: event.start,
+    sourceEnd: event.end, allDay: event.allDay, sourceUrl: event.sourceUrl,
+    targetEventId: diagnostic.targetEventId ?? null, calendarId: diagnostic.calendarId ?? null,
+    destinationId: diagnostic.destinationId ?? null, action, detail: diagnostic.detail ?? null,
+    errorMessage: diagnostic.errorMessage ?? null,
+  });
+
+  try {
+    const [events, storedMappings, storedTargets, exclusions] = await Promise.all([
+      schoolbox.getCalendarEvents(match.schoolbox.id, { pastDays: options.pastDays, futureDays: options.futureDays, now, signal: options.signal }),
+      getEventMappings(userId, target), listUserCalendarTargets(userId, target), getUserEventExclusions(userId, target),
+    ]);
+    counters.eventsFound = events.length;
+    stage = "reconciling_calendars";
+    await reconcileMicrosoftCalendars({ targets: storedTargets, userId, policy: options.syncPolicy, microsoft, signal: options.signal });
+    const existing = new Map(storedMappings.map((mapping) => [mapping.sourceKey, mapping]));
+    const seen = new Set<string>();
+    const excluded = new Set<string>();
+    const excludedRoots = new Set<string>();
+    const userExcluded = new Set<string>();
+    const userExcludedRoots = new Set<string>();
+    const targetPromises = new Map<string, Promise<string>>();
+    await recordDiscoveredEventTypes(events);
+    stage = "processing_events";
+    const targetFor = (destinationId: string) => {
+      const cached = targetPromises.get(destinationId);
+      if (cached) return cached;
+      const pending = resolveMicrosoftCalendarId({ destinationId, userId, timezone: options.timezone, policy: options.syncPolicy, microsoft, signal: options.signal });
+      targetPromises.set(destinationId, pending);
+      return pending;
+    };
+    const included: Array<{ event: NormalizedSchoolboxCalendarEvent; sourceKey: string }> = [];
+    for (const event of events) {
+      throwIfAborted(options.signal);
+      const sourceKey = `${event.sourceKey}:occurrence:${event.start}`;
+      if (seen.has(sourceKey) || excluded.has(sourceKey)) continue;
+      const policyEvent = { category: event.category ?? "other", type: event.type, allDay: event.allDay, completed: Boolean(event.completed) };
+      const globallyIncluded = eventIncludedByPolicy(policyEvent, options.syncPolicy);
+      const excludedForUser = globallyIncluded && eventExcludedForUser(policyEvent, exclusions);
+      if (!globallyIncluded || excludedForUser) {
+        excluded.add(sourceKey); excludedRoots.add(event.sourceKey);
+        if (excludedForUser) { userExcluded.add(sourceKey); userExcludedRoots.add(event.sourceKey); }
+        await recordEvent(event, sourceKey, "excluded", { detail: excludedForUser ? "Excluded by this person's custom settings." : "Excluded by Microsoft 365 target policy." });
+        continue;
+      }
+      seen.add(sourceKey);
+      included.push({ event, sourceKey });
+    }
+
+    await processInPool(included, MICROSOFT_EVENT_OPERATION_CONCURRENCY, async ({ event, sourceKey }) => {
+      counters.eventsIncluded += 1;
+      let calendarId: string | null = null;
+      let destinationId: string | null = null;
+      try {
+        const rule = resolveGoogleEventRule({ category: event.category ?? "other", type: event.type }, options.syncPolicy);
+        destinationId = rule.destinationId;
+        calendarId = await targetFor(destinationId);
+        const body = await microsoftEventBody(event, userId, options.timezone, sourceKey, options.syncPolicy, destinationId);
+        const hash = await createContentHash({
+          microsoftEventReconciliationVersion: MICROSOFT_EVENT_RECONCILIATION_VERSION,
+          body,
+        });
+        const mapping = existing.get(sourceKey);
+        const calendarChanged = Boolean(mapping && mapping.calendarId !== calendarId);
+        if (mapping?.sourceHash === hash && !calendarChanged) {
+          await touchEventMapping(userId, sourceKey, run.id, { title: event.title, description: event.description,
+            location: event.location, author: event.author, eventType: event.type, category: event.category ?? "other",
+            allDay: event.allDay, sourceUrl: event.sourceUrl, destinationId }, target);
+          counters.eventsUnchanged += 1; targetRun.eventsUnchanged += 1;
+          await recordEvent(event, sourceKey, "unchanged", { targetEventId: mapping.targetEventId, calendarId, destinationId, detail: "The managed Microsoft 365 event already matched the Schoolbox source." });
+          return;
+        }
+        let eventId = mapping?.targetEventId;
+        let createdAt = mapping?.createdAt ?? new Date().toISOString();
+        let action: "created" | "updated" = "created";
+        if (mapping && !calendarChanged && body.isReminderOn !== undefined) {
+          try {
+            const updated = await microsoft.updateEvent(
+              userId,
+              mapping.targetEventId,
+              microsoftEventPatchBody(body),
+              { calendarId: calendarId === "primary" ? undefined : calendarId, signal: options.signal },
+            );
+            eventId = updated.id?.trim() || mapping.targetEventId;
+            counters.eventsUpdated += 1; targetRun.eventsUpdated += 1; action = "updated";
+          } catch (error) {
+            if (!(error instanceof MicrosoftGraphError) || (error.status !== 404 && error.status !== 410)) throw error;
+            const created = await microsoft.insertEvent(
+              userId,
+              await microsoftReplacementEventBody(body, mapping.targetEventId),
+              { calendarId: calendarId === "primary" ? undefined : calendarId, signal: options.signal },
+            );
+            eventId = created.id?.trim();
+            if (!eventId) throw new Error("Microsoft created a replacement event without returning its identifier.");
+            counters.eventsUpdated += 1; targetRun.eventsUpdated += 1; action = "updated";
+            createdAt = new Date().toISOString();
+          }
+        } else {
+          // Graph PATCH preserves omitted reminder properties. Recreating a
+          // mapped event is therefore the only supported way to reapply the
+          // mailbox's Outlook defaults without guessing a reminder interval.
+          const createBody = mapping
+            ? await microsoftReplacementEventBody(body, mapping.targetEventId)
+            : body;
+          const created = await microsoft.insertEvent(userId, createBody, { calendarId: calendarId === "primary" ? undefined : calendarId, signal: options.signal });
+          eventId = created.id?.trim();
+          if (!eventId) throw new Error("Microsoft created an event without returning its identifier.");
+          if (mapping) {
+            try { await microsoft.deleteEvent(userId, mapping.targetEventId, { calendarId: mapping.calendarId === "primary" ? undefined : mapping.calendarId, signal: options.signal }); }
+            catch (error) { if (!(error instanceof MicrosoftGraphError) || (error.status !== 404 && error.status !== 410)) throw error; }
+            counters.eventsUpdated += 1; targetRun.eventsUpdated += 1; action = "updated";
+          } else { counters.eventsCreated += 1; targetRun.eventsCreated += 1; }
+          createdAt = new Date().toISOString();
+        }
+        await upsertEventMapping({ target, targetUserId: userId, targetEventId: eventId, sourceKey,
+          calendarId, sourceHash: hash, sourceStart: event.start, sourceEnd: event.end,
+          lastSeenRunId: run.id, createdAt, updatedAt: new Date().toISOString(), title: event.title,
+          description: event.description, location: event.location, author: event.author,
+          eventType: event.type, category: event.category ?? "other", allDay: event.allDay,
+          sourceUrl: event.sourceUrl, destinationId });
+        await recordEvent(event, sourceKey, action, { targetEventId: eventId, calendarId, destinationId,
+          detail: calendarChanged ? "The managed event was moved to its configured Microsoft 365 calendar." : `A managed Microsoft 365 event was ${action}.` });
+      } catch (error) {
+        await recordEvent(event, sourceKey, "failed", { calendarId, destinationId, detail: "Failure while processing this Microsoft 365 event.", errorMessage: syncErrorMessage(error, options.signal) });
+        throw error;
+      }
+    }, options.signal);
+
+    stage = "reconciling_removed_events";
+    const removals = storedMappings.filter((mapping) => {
+      if (seen.has(mapping.sourceKey)) return false;
+      const marker = mapping.sourceKey.lastIndexOf(":occurrence:");
+      const root = marker >= 0 ? mapping.sourceKey.slice(0, marker) : mapping.sourceKey;
+      const excludedByPolicy = excluded.has(mapping.sourceKey) || excludedRoots.has(root);
+      if (excludedByPolicy ? !options.syncPolicy.deleteExcludedEvents : !options.syncPolicy.deleteMissingEvents) return false;
+      const sourceStart = new Date(mapping.sourceStart); const sourceEnd = new Date(mapping.sourceEnd);
+      return sourceStart < windowEnd && sourceEnd > windowStart;
+    });
+    await processInPool(removals, MICROSOFT_EVENT_OPERATION_CONCURRENCY, async (mapping) => {
+      try { await microsoft.deleteEvent(userId, mapping.targetEventId, { calendarId: mapping.calendarId === "primary" ? undefined : mapping.calendarId, signal: options.signal }); }
+      catch (error) { if (!(error instanceof MicrosoftGraphError) || (error.status !== 404 && error.status !== 410)) throw error; }
+      await deleteEventMapping(userId, mapping.sourceKey, target);
+      counters.eventsDeleted += 1; targetRun.eventsDeleted += 1;
+      const marker = mapping.sourceKey.lastIndexOf(":occurrence:");
+      const root = marker >= 0 ? mapping.sourceKey.slice(0, marker) : mapping.sourceKey;
+      await recordRunEventDiagnostic({ runId: run.id, target, targetUserId: userId, sourceKey: mapping.sourceKey,
+        title: mapping.title, description: mapping.description, location: mapping.location, author: mapping.author,
+        eventType: mapping.eventType, category: mapping.category, sourceStart: mapping.sourceStart,
+        sourceEnd: mapping.sourceEnd, allDay: mapping.allDay, sourceUrl: mapping.sourceUrl,
+        targetEventId: mapping.targetEventId, calendarId: mapping.calendarId, destinationId: mapping.destinationId,
+        action: "deleted", detail: userExcluded.has(mapping.sourceKey) || userExcludedRoots.has(root)
+          ? "The managed Microsoft 365 event was deleted because it is excluded for this person."
+          : "The managed Microsoft 365 event was deleted during reconciliation.", errorMessage: null });
+    }, options.signal);
+    stage = "saving_user_result";
+    counters.managedEventsAfter = (await getEventMappings(userId, target)).length;
+    await upsertUserMapping({ ...baseMapping, status: "synced", lastSyncAt: new Date().toISOString(), lastError: null, eventCount: counters.managedEventsAfter });
+    await finishRunUserDiagnostic({ runId: run.id, target, targetUserId: userId, status: "completed", stage: "completed", ...counters, errorMessage: null });
+    targetRun.usersSynced += 1;
+  } catch (error) {
+    const message = syncErrorMessage(error, options.signal);
+    try { counters.managedEventsAfter = (await getEventMappings(userId, target)).length; } catch { /* preserve original error */ }
+    await upsertUserMapping({ ...baseMapping, status: "error", lastSyncAt: new Date().toISOString(), lastError: message.slice(0, 2_000), eventCount: counters.managedEventsAfter });
+    await finishRunUserDiagnostic({ runId: run.id, target, targetUserId: userId, status: "failed", stage, ...counters, errorMessage: message });
+    targetRun.errors += 1;
+  }
+}
 
 async function resolveCalendarId(options: {
   destinationId: string;
@@ -834,27 +1249,28 @@ async function syncUser(
 }
 
 /**
- * Pauses one user and removes Google events tracked in Relay's event_mappings
- * table. When explicitly requested, it then permanently deletes only the
- * secondary calendars recorded in user_calendar_targets. Deleting a calendar
+ * Pauses one target account and removes only events tracked in Relay's
+ * provider-qualified mapping table. When explicitly requested, it then
+ * permanently deletes only the tracked secondary calendars. Deleting a calendar
  * also deletes any manually added content it contains, so this path never
  * accepts a primary or untracked calendar ID.
  */
 export async function cleanupUserManagedEvents(
-  googleUserId: string,
+  targetUserId: string,
   actor: string,
-  clientOverride?: GoogleCleanupClient,
-  options: { deleteCalendars?: boolean } = {},
+  clientOverride?: TargetCleanupClient,
+  options: { deleteCalendars?: boolean; target?: TargetProvider; timeoutMs?: number } = {},
 ): Promise<ManagedEventCleanupResult> {
-  const userId = googleUserId.trim();
+  const target = options.target ?? "google";
+  const userId = targetUserId.trim();
   if (!userId) throw new HttpError(400, "Choose a user to clean up");
 
-  const mapping = await getUserMapping(userId);
+  const mapping = await getUserMapping(userId, target);
   if (!mapping) throw new HttpError(404, "This user is no longer available");
 
   const [storedMappings, storedCalendarTargets] = await Promise.all([
-    getEventMappings(userId),
-    listUserCalendarTargets(userId),
+    getEventMappings(userId, target),
+    listUserCalendarTargets(userId, target),
   ]);
   const deleteCalendars = options.deleteCalendars === true;
   const hasDestructiveWork = storedMappings.length > 0 || (deleteCalendars && storedCalendarTargets.length > 0);
@@ -868,10 +1284,11 @@ export async function cleanupUserManagedEvents(
 
   // Pausing before the first delete prevents future scheduled runs from
   // recreating the events immediately after a successful cleanup.
-  await setUsersSyncEnabled([userId], false, actor);
+  await setUsersSyncEnabled([userId], false, actor, target);
   if (!hasDestructiveWork) {
     await recordManagedEventCleanup({
-      googleUserId: userId,
+      target,
+      targetUserId: userId,
       remaining: 0,
       deleted: 0,
       alreadyMissing: 0,
@@ -891,19 +1308,27 @@ export async function cleanupUserManagedEvents(
     };
   }
 
-  let google: GoogleCleanupClient;
+  let client: TargetCleanupClient;
+  let cleanupTimeoutMs: number;
   try {
+    const config = await getConfig(!clientOverride);
+    cleanupTimeoutMs = positiveTimeout(options.timeoutMs, config.userSyncTimeoutSeconds * 1_000);
     if (clientOverride) {
-      google = clientOverride;
+      client = clientOverride;
     } else {
-      const config = await getConfig(true);
-      if (!config.googleServiceAccountJson) throw new HttpError(409, "Google Workspace is not configured");
-      google = new GoogleWorkspaceClient(parseServiceAccountJson(config.googleServiceAccountJson));
+      if (target === "google") {
+        if (!config.googleServiceAccountJson) throw new HttpError(409, "Google Workspace is not configured");
+        client = new GoogleWorkspaceClient(parseServiceAccountJson(config.googleServiceAccountJson));
+      } else {
+        if (!config.microsoftTenantId || !config.microsoftClientId || !config.microsoftClientSecret) throw new HttpError(409, "Microsoft 365 is not configured");
+        client = new MicrosoftGraphClient({ tenantId: config.microsoftTenantId, clientId: config.microsoftClientId, clientSecret: config.microsoftClientSecret });
+      }
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Google Workspace cleanup could not start";
+    const message = error instanceof Error ? error.message : "Calendar target cleanup could not start";
     await recordManagedEventCleanup({
-      googleUserId: userId,
+      target,
+      targetUserId: userId,
       remaining: storedMappings.length,
       deleted: 0,
       alreadyMissing: 0,
@@ -917,55 +1342,78 @@ export async function cleanupUserManagedEvents(
   let deleted = 0;
   let alreadyMissing = 0;
   let cleanupError: string | null = null;
-  for (const eventMapping of storedMappings) {
-    try {
-      await google.deleteEvent(mapping.googleEmail, eventMapping.googleEventId, {
-        calendarId: eventMapping.calendarId,
-        quotaUser: userId,
-        sendUpdates: "none",
-      });
-      deleted += 1;
-    } catch (error) {
-      if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) {
-        alreadyMissing += 1;
-      } else {
-        cleanupError = error instanceof Error ? error.message : "Google Calendar cleanup failed";
-        break;
-      }
-    }
-    await deleteEventMapping(userId, eventMapping.sourceKey);
-  }
-
-  let remaining = (await getEventMappings(userId)).length;
   let calendarsDeleted = 0;
   let calendarsAlreadyMissing = 0;
-  if (deleteCalendars && remaining === 0 && storedCalendarTargets.length > 0) {
-    if (!google.deleteCalendar) {
-      cleanupError = "Google Calendar cleanup does not support deleting secondary calendars";
-    } else {
-      for (const target of storedCalendarTargets) {
-        let removeTargetRecords = false;
-        try {
-          await google.deleteCalendar(mapping.googleEmail, target.googleCalendarId, { quotaUser: userId });
-          calendarsDeleted += 1;
-          removeTargetRecords = true;
-        } catch (error) {
-          if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) {
-            calendarsAlreadyMissing += 1;
-            removeTargetRecords = true;
-          } else {
-            cleanupError = error instanceof Error ? error.message : "Google Calendar cleanup failed";
+  try {
+    await withHardDeadline(
+      undefined,
+      cleanupTimeoutMs,
+      `Managed ${target === "google" ? "Google" : "Microsoft 365"} cleanup exceeded ${durationLabel(cleanupTimeoutMs)}`,
+      async (signal) => {
+        for (const eventMapping of storedMappings) {
+          throwIfAborted(signal);
+          let removalOutcome: "deleted" | "already_missing" | null = null;
+          try {
+            if (target === "google") await (client as GoogleCleanupClient).deleteEvent(mapping.targetEmail, eventMapping.targetEventId, {
+              calendarId: eventMapping.calendarId, quotaUser: userId, sendUpdates: "none", signal,
+            });
+            else await (client as MicrosoftCleanupClient).deleteEvent(userId, eventMapping.targetEventId, {
+              calendarId: eventMapping.calendarId === "primary" ? undefined : eventMapping.calendarId,
+              signal,
+            });
+            removalOutcome = "deleted";
+          } catch (error) {
+            if ((error instanceof GoogleApiError || error instanceof MicrosoftGraphError) && (error.status === 404 || error.status === 410)) {
+              removalOutcome = "already_missing";
+            } else {
+              cleanupError = syncErrorMessage(error, signal);
+              break;
+            }
+          }
+          if (removalOutcome) {
+            await deleteEventMapping(userId, eventMapping.sourceKey, target);
+            if (removalOutcome === "deleted") deleted += 1;
+            else alreadyMissing += 1;
           }
         }
-        if (removeTargetRecords) await deleteCalendarTargetRecords(userId, target.destinationId, target.googleCalendarId);
-      }
-      remaining = (await getEventMappings(userId)).length;
-    }
+
+        const remainingEvents = (await getEventMappings(userId, target)).length;
+        if (!deleteCalendars || remainingEvents > 0 || storedCalendarTargets.length === 0) return;
+        if (!client.deleteCalendar) {
+          cleanupError = `${target === "google" ? "Google" : "Microsoft 365"} cleanup does not support deleting secondary calendars`;
+          return;
+        }
+        for (const calendarTarget of storedCalendarTargets) {
+          throwIfAborted(signal);
+          let removalOutcome: "deleted" | "already_missing" | null = null;
+          try {
+            if (target === "microsoft") await (client as MicrosoftCleanupClient).deleteCalendar!(userId, calendarTarget.targetCalendarId, { signal });
+            else await (client as GoogleCleanupClient).deleteCalendar!(mapping.targetEmail, calendarTarget.targetCalendarId, { quotaUser: userId, signal });
+            removalOutcome = "deleted";
+          } catch (error) {
+            if ((error instanceof GoogleApiError || error instanceof MicrosoftGraphError) && (error.status === 404 || error.status === 410)) {
+              removalOutcome = "already_missing";
+            } else {
+              cleanupError = syncErrorMessage(error, signal);
+            }
+          }
+          if (removalOutcome) {
+            await deleteCalendarTargetRecords(userId, calendarTarget.destinationId, calendarTarget.targetCalendarId, target);
+            if (removalOutcome === "deleted") calendarsDeleted += 1;
+            else calendarsAlreadyMissing += 1;
+          }
+        }
+      },
+    );
+  } catch (error) {
+    cleanupError = syncErrorMessage(error);
   }
 
-  const calendarsRemaining = (await listUserCalendarTargets(userId)).length;
+  const remaining = (await getEventMappings(userId, target)).length;
+  const calendarsRemaining = (await listUserCalendarTargets(userId, target)).length;
   await recordManagedEventCleanup({
-    googleUserId: userId,
+    target,
+    targetUserId: userId,
     remaining,
     deleted,
     alreadyMissing,
@@ -989,22 +1437,25 @@ export async function cleanupUserManagedEvents(
 
 /**
  * Permanently removes one managed secondary-calendar destination from every
- * tracked user. The destination is removed from policy before Google deletion
+ * tracked user. The destination is removed from policy before provider deletion
  * starts so a subsequent sync cannot recreate it. Failed target records are
  * retained and shown as retired cleanup work that an administrator can retry.
  */
 export async function retireCalendarDestination(
   destinationId: string,
   actor: string,
-  clientOverride?: GoogleCalendarRetirementClient,
+  clientOverride?: CalendarRetirementClient,
+  target: TargetProvider = "google",
+  runtimeOptions: Pick<SyncRuntimeOptions, "runTimeoutMs"> = {},
 ): Promise<CalendarDestinationRetirementResult> {
   const id = destinationId.trim();
   if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(id)) throw new HttpError(400, "Choose a valid calendar destination");
   if (id === "primary") throw new HttpError(400, "The primary calendar cannot be deleted");
 
   const initialConfig = await getConfig(false);
-  const initialTargets = await listCalendarTargetsForDestination(id);
-  if (!initialConfig.syncPolicy.secondaryCalendars.some((calendar) => calendar.id === id) && initialTargets.length === 0) {
+  const initialPolicy = target === "google" ? initialConfig.syncPolicy : initialConfig.microsoftSyncPolicy;
+  const initialTargets = await listCalendarTargetsForDestination(id, target);
+  if (!initialPolicy.secondaryCalendars.some((calendar) => calendar.id === id) && initialTargets.length === 0) {
     throw new HttpError(404, "This calendar destination is no longer available");
   }
 
@@ -1026,71 +1477,109 @@ export async function retireCalendarDestination(
 
   try {
     const config = await getConfig(true);
-    const targets = await listCalendarTargetsForDestination(id);
-    run.usersDiscovered = targets.length;
-    run.usersMatched = targets.length;
-    await checkpointRun(run, "calendar_retirement", `${targets.length} tracked user calendar(s) queued for retirement.`);
+    const retirementTimeoutMs = positiveTimeout(runtimeOptions.runTimeoutMs, config.runTimeoutMinutes * 60_000);
+    await withHardDeadline(
+      undefined,
+      retirementTimeoutMs,
+      `Calendar destination retirement exceeded ${durationLabel(retirementTimeoutMs)}`,
+      async (signal) => {
+        const targets = await listCalendarTargetsForDestination(id, target);
+        run.usersDiscovered = targets.length;
+        run.usersMatched = targets.length;
+        await checkpointRun(run, "calendar_retirement", `${targets.length} tracked user calendar(s) queued for retirement.`);
 
-    let google: GoogleCalendarRetirementClient | null = clientOverride ?? null;
-    if (targets.length > 0 && !google) {
-      if (!config.googleServiceAccountJson) throw new HttpError(409, "Google Workspace is not configured");
-      google = new GoogleWorkspaceClient(parseServiceAccountJson(config.googleServiceAccountJson));
-    }
-
-    if (config.syncPolicy.secondaryCalendars.some((calendar) => calendar.id === id)) {
-      await saveConfig({
-        syncPolicy: withoutManagedCalendarDestination(config.syncPolicy, id),
-      }, actor);
-    }
-
-    const errors: string[] = [];
-    await processInPool(targets, config.concurrency, async (target) => {
-      let removeTargetRecords = false;
-      try {
-        await google!.deleteCalendar(target.googleEmail, target.googleCalendarId, {
-          quotaUser: target.googleUserId,
-        });
-        result.calendarsDeleted += 1;
-        removeTargetRecords = true;
-      } catch (error) {
-        if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) {
-          result.calendarsAlreadyMissing += 1;
-          removeTargetRecords = true;
-        } else {
-          result.calendarsFailed += 1;
-          const message = error instanceof Error ? error.message : "Google Calendar deletion failed";
-          if (!errors.includes(message)) errors.push(message);
+        let calendarClient: CalendarRetirementClient | null = clientOverride ?? null;
+        if (targets.length > 0 && !calendarClient) {
+          if (target === "google") {
+            if (!config.googleServiceAccountJson) throw new HttpError(409, "Google Workspace is not configured");
+            calendarClient = new GoogleWorkspaceClient(parseServiceAccountJson(config.googleServiceAccountJson));
+          } else {
+            if (!config.microsoftTenantId || !config.microsoftClientId || !config.microsoftClientSecret) {
+              throw new HttpError(409, "Microsoft 365 is not configured");
+            }
+            calendarClient = new MicrosoftGraphClient({
+              tenantId: config.microsoftTenantId,
+              clientId: config.microsoftClientId,
+              clientSecret: config.microsoftClientSecret,
+            });
+          }
         }
-      }
-      if (removeTargetRecords) {
-        const removed = await deleteCalendarTargetRecords(
-          target.googleUserId,
-          id,
-          target.googleCalendarId,
-        );
-        result.eventMappingsRemoved += removed;
-        run.eventsDeleted += removed;
-        run.usersSynced += 1;
-      }
-      await checkpointRun(
-        run,
-        "calendar_retirement",
-        `${run.usersSynced + result.calendarsFailed} of ${targets.length} tracked user calendar(s) processed.`,
-      );
-    });
 
-    result.calendarsRemaining = (await listCalendarTargetsForDestination(id)).length;
-    result.error = errors.length > 0 ? errors.join("; ").slice(0, 2_000) : null;
-    run.errors = result.calendarsFailed;
-    run.status = result.calendarsFailed > 0 ? "completed_with_errors" : "completed";
-    run.message = result.calendarsFailed > 0
-      ? `Calendar destination ${id} was retired, but ${result.calendarsRemaining} user calendar(s) still require deletion.`
-      : `Calendar destination ${id} was retired and ${result.calendarsDeleted + result.calendarsAlreadyMissing} tracked user calendar(s) were removed.`;
+        const policy = target === "google" ? config.syncPolicy : config.microsoftSyncPolicy;
+        if (policy.secondaryCalendars.some((calendar) => calendar.id === id)) {
+          await saveConfig(target === "google"
+            ? { syncPolicy: withoutManagedCalendarDestination(policy, id) }
+            : { microsoftSyncPolicy: withoutManagedCalendarDestination(policy, id) }, actor);
+        }
+
+        const errors: string[] = [];
+        await processInPool(targets, config.concurrency, async (calendarTarget) => {
+          let removalOutcome: "deleted" | "already_missing" | null = null;
+          try {
+            if (calendarTarget.target === "google") {
+              await (calendarClient as GoogleCalendarRetirementClient).deleteCalendar(
+                calendarTarget.targetEmail,
+                calendarTarget.targetCalendarId,
+                { quotaUser: calendarTarget.targetUserId, signal },
+              );
+            } else {
+              await (calendarClient as MicrosoftCalendarRetirementClient).deleteCalendar(
+                calendarTarget.targetUserId,
+                calendarTarget.targetCalendarId,
+                { signal },
+              );
+            }
+            removalOutcome = "deleted";
+          } catch (error) {
+            if ((error instanceof GoogleApiError || error instanceof MicrosoftGraphError) &&
+                (error.status === 404 || error.status === 410)) {
+              removalOutcome = "already_missing";
+            } else {
+              result.calendarsFailed += 1;
+              const message = syncErrorMessage(error, signal);
+              if (!errors.includes(message)) errors.push(message);
+            }
+          }
+          if (removalOutcome) {
+            const removed = await deleteCalendarTargetRecords(
+              calendarTarget.targetUserId,
+              id,
+              calendarTarget.targetCalendarId,
+              calendarTarget.target,
+            );
+            result.eventMappingsRemoved += removed;
+            if (removalOutcome === "deleted") result.calendarsDeleted += 1;
+            else result.calendarsAlreadyMissing += 1;
+            run.eventsDeleted += removed;
+            run.usersSynced += 1;
+          }
+          await checkpointRun(
+            run,
+            "calendar_retirement",
+            `${run.usersSynced + result.calendarsFailed} of ${targets.length} tracked user calendar(s) processed.`,
+          );
+        }, signal);
+
+        result.calendarsRemaining = (await listCalendarTargetsForDestination(id, target)).length;
+        result.error = errors.length > 0 ? errors.join("; ").slice(0, 2_000) : null;
+        run.errors = result.calendarsFailed;
+        run.status = result.calendarsFailed > 0 ? "completed_with_errors" : "completed";
+        run.message = result.calendarsFailed > 0
+          ? `Calendar destination ${id} was retired, but ${result.calendarsRemaining} user calendar(s) still require deletion.`
+          : `Calendar destination ${id} was retired and ${result.calendarsDeleted + result.calendarsAlreadyMissing} tracked user calendar(s) were removed.`;
+      },
+    );
   } catch (error) {
     unexpectedError = error;
+    try {
+      result.calendarsRemaining = (await listCalendarTargetsForDestination(id, target)).length;
+    } catch {
+      // Preserve the retirement failure when remaining-work diagnostics fail.
+    }
+    result.error = syncErrorMessage(error);
     run.status = "failed";
     run.errors += 1;
-    run.message = error instanceof Error ? error.message : "Calendar destination retirement failed.";
+    run.message = result.error || "Calendar destination retirement failed.";
   } finally {
     clearInterval(heartbeat);
     run.completedAt = new Date().toISOString();
@@ -1107,16 +1596,42 @@ export async function runFullSync(
   actor: string,
   clientOverrides: SyncClientOverrides = {},
   runtimeOptions: SyncRuntimeOptions = {},
+  requestedTargets?: TargetProvider[],
 ): Promise<RunSummary> {
   const config = await getConfig(true);
   if (!config.schoolboxBaseUrl || !config.schoolboxToken) {
     throw new HttpError(409, "Schoolbox is not configured");
   }
-  if (!config.googleServiceAccountJson || !config.googleAdminEmail) {
+  if (!config.schoolboxSetupCompleted) {
+    throw new HttpError(409, "Schoolbox setup has not been completed and verified");
+  }
+  const targetEnabled = (target: TargetProvider) => target === "google"
+    ? config.googleEnabled
+    : config.microsoftEnabled;
+  const targetSetupCompleted = (target: TargetProvider) => target === "google"
+    ? config.googleSetupCompleted
+    : config.microsoftSetupCompleted;
+  if (requestedTargets?.some((target) => !targetEnabled(target))) {
+    throw new HttpError(409, "One or more requested calendar targets are disabled");
+  }
+  if (requestedTargets?.some((target) => !targetSetupCompleted(target))) {
+    throw new HttpError(409, "One or more requested calendar targets have not completed setup and verification");
+  }
+  const configuredTargets = (["google", "microsoft"] as TargetProvider[]).filter((target) =>
+    targetEnabled(target) && targetSetupCompleted(target),
+  );
+  const enabledTargets = requestedTargets?.length ? [...new Set(requestedTargets)] : configuredTargets;
+  if (enabledTargets.length === 0) throw new HttpError(409, "No completed calendar target is enabled");
+  if (enabledTargets.includes("google") && (!config.googleServiceAccountJson || !config.googleAdminEmail)) {
     throw new HttpError(409, "Google Workspace is not configured");
   }
+  if (enabledTargets.includes("microsoft") && (!config.microsoftTenantId || !config.microsoftClientId || !config.microsoftClientSecret)) {
+    throw new HttpError(409, "Microsoft 365 is not configured");
+  }
+  if (enabledTargets.includes("microsoft") && !config.microsoftConsentGrantedAt) {
+    throw new HttpError(409, "Microsoft 365 admin consent has not been verified");
+  }
   const schoolboxToken = config.schoolboxToken;
-  const googleServiceAccountJson = config.googleServiceAccountJson;
 
   await recoverStaleRuns();
   const run = await createRun(trigger);
@@ -1149,129 +1664,110 @@ export async function runFullSync(
           pastDays: config.pastDays,
           futureDays: config.futureDays,
         });
-        const google = clientOverrides.google
-          ?? new GoogleWorkspaceClient(parseServiceAccountJson(googleServiceAccountJson));
-        await checkpointRun(run, "discovery", "Waiting for Schoolbox and Google Directory user lists.");
-        const discoveryController = new AbortController();
-        const forwardRunAbort = () => discoveryController.abort(runSignal.reason);
-        if (runSignal.aborted) forwardRunAbort();
-        else runSignal.addEventListener("abort", forwardRunAbort, { once: true });
+        await checkpointRun(run, "discovery", `Waiting for Schoolbox and ${enabledTargets.length} calendar target director${enabledTargets.length === 1 ? "y" : "ies"}.`);
         let schoolboxProgress = "not started";
-        let googleProgress = "not started";
-        const reportDiscoveryProgress = () => checkpointRun(
-          run,
-          "discovery",
-          `Schoolbox: ${schoolboxProgress}. Google Directory: ${googleProgress}.`,
-        );
-        const [schoolboxUsers, googleUsers] = await (async () => {
-          try {
-            const schoolboxPromise = withHardDeadline(
-              discoveryController.signal,
-              discoveryTimeoutMs,
-              `Schoolbox user discovery timed out after ${durationLabel(discoveryTimeoutMs)}.`,
-              (signal) => schoolbox.getAllUsers({
-                signal,
-                onPage: async (progress) => {
-                  schoolboxProgress = progress.totalItems === null
-                    ? `page ${progress.pageNumber}, ${progress.accumulatedItems} loaded`
-                    : `page ${progress.pageNumber}, ${progress.accumulatedItems} of ${progress.totalItems} loaded`;
-                  await reportDiscoveryProgress();
-                },
-              }),
-            ).then(async (users) => {
-              schoolboxProgress = "complete";
-              await reportDiscoveryProgress();
-              return users;
-            });
-            const googlePromise = withHardDeadline(
-              discoveryController.signal,
-              discoveryTimeoutMs,
-              `Google Directory user discovery timed out after ${durationLabel(discoveryTimeoutMs)}.`,
-              (signal) => google.listAllUsers(config.googleAdminEmail, {
-                customer: config.googleCustomer || "my_customer",
-                signal,
-                onPage: async (progress) => {
-                  googleProgress = `page ${progress.pageNumber}, ${progress.accumulatedItems} loaded`;
-                  await reportDiscoveryProgress();
-                },
-              }),
-            ).then(async (users) => {
-              googleProgress = "complete";
-              await reportDiscoveryProgress();
-              return users;
-            });
-            return await Promise.all([schoolboxPromise, googlePromise]);
-          } catch (error) {
-            discoveryController.abort(error);
-            throw error;
-          } finally {
-            runSignal.removeEventListener("abort", forwardRunAbort);
-          }
-        })();
-
-        await checkpointRun(run, "matching", "Matching active Google and Schoolbox identities.");
+        const schoolboxUsers = await withHardDeadline(runSignal, discoveryTimeoutMs,
+          `Schoolbox user discovery timed out after ${durationLabel(discoveryTimeoutMs)}.`,
+          (signal) => schoolbox.getAllUsers({ signal, onPage: async (progress) => {
+            schoolboxProgress = progress.totalItems === null
+              ? `page ${progress.pageNumber}, ${progress.accumulatedItems} loaded`
+              : `page ${progress.pageNumber}, ${progress.accumulatedItems} of ${progress.totalItems} loaded`;
+            await checkpointRun(run, "discovery", `Schoolbox: ${schoolboxProgress}.`);
+          } }));
+        schoolboxProgress = "complete";
         const schoolboxByEmail = indexActiveSchoolboxUsersByEmail(schoolboxUsers);
-        const activeGoogle = googleUsers.filter(isGoogleActive);
-        const matched: MatchedUser[] = [];
-        const discoveredAt = new Date().toISOString();
-        const discoveries = activeGoogle.map((googleUser) => {
-          const googleEmail = normalizedEmail(googleUser.primaryEmail);
-          const schoolboxUser = schoolboxByEmail.get(googleEmail);
-          if (schoolboxUser) matched.push({ google: googleUser, schoolbox: schoolboxUser, schoolboxEmail: googleEmail });
-          return {
-            googleUserId: googleUser.id,
-            googleEmail: googleUser.primaryEmail,
-            schoolboxUserId: schoolboxUser?.id ?? null,
-            schoolboxEmail: schoolboxUser ? googleEmail : null,
-            displayName: googleDisplayName(googleUser) || (schoolboxUser ? schoolboxDisplayName(schoolboxUser) : null),
-            role: schoolboxUser ? schoolboxRole(schoolboxUser) : null,
-            status: schoolboxUser ? "pending" : "unmatched",
-            lastSyncAt: null,
-            lastError: schoolboxUser ? null : "No active Schoolbox user has this primary or alternate email address.",
-            eventCount: 0,
-            updatedAt: discoveredAt,
-          };
-        });
-        run.usersDiscovered = activeGoogle.length;
-        const selection = await discoverUserMappings(discoveries, config.syncNewUsersByDefault);
-        run.usersMatched = matched.length;
-        const selected = matched.filter((match) => selection.get(match.google.id) === true);
-        await checkpointRun(
-          run,
-          "user_sync",
-          `${selected.length} enabled user calendar(s) queued; ${matched.length - selected.length} matched user(s) paused.`,
-        );
-        await processInPool(selected, config.concurrency, async (match) => {
-          const deadline = createDeadlineSignal(
-            runSignal,
-            userSyncTimeoutMs,
-            `User calendar synchronization timed out after ${durationLabel(userSyncTimeoutMs)}.`,
-          );
+        await checkpointRun(run, "target_sync", `Schoolbox discovery completed; ${enabledTargets.length} calendar target branch(es) are running.`);
+        const targetResults = await Promise.all(enabledTargets.map(async (target) => {
+          const targetRun = await startRunTarget(run.id, target);
           try {
-            await syncUser(match, run, schoolbox, google, {
-              pastDays: config.pastDays,
-              futureDays: config.futureDays,
-              timezone: config.timezone,
-              syncPolicy: config.syncPolicy,
-              signal: deadline.signal,
-            });
-          } finally {
-            deadline.dispose();
-          }
-          throwIfAborted(runSignal);
-          await checkpointRun(
-            run,
-            "user_sync",
-            `${run.usersSynced + run.errors} of ${selected.length} enabled user calendar(s) processed.`,
-          );
-        }, runSignal);
+            if (target === "google") {
+              const google = clientOverrides.google ?? new GoogleWorkspaceClient(parseServiceAccountJson(config.googleServiceAccountJson!));
+              targetRun.phase = "discovery";
+              const users = await withHardDeadline(runSignal, discoveryTimeoutMs,
+                `Google Directory user discovery timed out after ${durationLabel(discoveryTimeoutMs)}.`,
+                (signal) => google.listAllUsers(config.googleAdminEmail, { customer: config.googleCustomer || "my_customer", signal,
+                  onPage: async (progress) => checkpointRunTarget(targetRun, "discovery", `Google Directory page ${progress.pageNumber}: ${progress.accumulatedItems} loaded.`) }));
+              const active = users.filter(isGoogleActive);
+              const matched: MatchedUser[] = [];
+              const discoveredAt = new Date().toISOString();
+              const discoveries = active.map((user) => {
+                const match = directorySchoolboxMatch(googleMatchEmails(user), schoolboxByEmail);
+                if (match) matched.push({ google: user, schoolbox: match.schoolbox, schoolboxEmail: match.matchedEmail });
+                return { target, targetUserId: user.id, targetEmail: user.primaryEmail, schoolboxUserId: match?.schoolbox.id ?? null,
+                  schoolboxEmail: match?.matchedEmail ?? null, displayName: googleDisplayName(user) || (match ? schoolboxDisplayName(match.schoolbox) : null),
+                  role: match ? schoolboxRole(match.schoolbox) : null, status: match ? "pending" : "unmatched",
+                  lastSyncAt: null, lastError: match ? null : "No active Schoolbox user has a matching primary or alternate email address.", eventCount: 0, updatedAt: discoveredAt };
+              });
+              targetRun.usersDiscovered = active.length; targetRun.usersMatched = matched.length;
+              const selection = await discoverUserMappings(discoveries, config.syncNewGoogleUsersByDefault, target);
+              const selected = matched.filter((match) => selection.get(match.google.id)); targetRun.usersSelected = selected.length;
+              await checkpointRunTarget(targetRun, "user_sync", `${selected.length} Google account(s) queued.`);
+              let processed = 0;
+              await processInPool(selected, config.concurrency, async (match) => {
+                const deadline = createDeadlineSignal(runSignal, userSyncTimeoutMs, `User calendar synchronization timed out after ${durationLabel(userSyncTimeoutMs)}.`);
+                try { await syncUser(match, run, schoolbox, google, { pastDays: config.pastDays, futureDays: config.futureDays, timezone: config.timezone, syncPolicy: config.syncPolicy, signal: deadline.signal }); }
+                finally { deadline.dispose(); }
+                processed += 1;
+                await checkpointRunTarget(targetRun, "user_sync", `${processed} of ${selected.length} Google account(s) processed.`);
+              }, runSignal);
+              // Derive target totals from persisted per-user diagnostics. Reading the
+              // completed rows avoids races between concurrent Google user workers.
+              const diagnostics = await listRunUserDiagnostics(run.id, "google");
+              targetRun.usersSynced = diagnostics.filter((item) => item.status === "completed").length;
+              targetRun.errors = diagnostics.filter((item) => item.status === "failed").length;
+              targetRun.eventsCreated = diagnostics.reduce((sum, item) => sum + item.eventsCreated, 0);
+              targetRun.eventsUpdated = diagnostics.reduce((sum, item) => sum + item.eventsUpdated, 0);
+              targetRun.eventsDeleted = diagnostics.reduce((sum, item) => sum + item.eventsDeleted, 0);
+              targetRun.eventsUnchanged = diagnostics.reduce((sum, item) => sum + item.eventsUnchanged, 0);
+              await checkpointRunTarget(targetRun, "user_sync", `${diagnostics.length} of ${selected.length} Google account(s) processed.`);
+            } else {
+              const microsoft = clientOverrides.microsoft ?? new MicrosoftGraphClient({ tenantId: config.microsoftTenantId, clientId: config.microsoftClientId, clientSecret: config.microsoftClientSecret! });
+              const users = await withHardDeadline(runSignal, discoveryTimeoutMs,
+                `Microsoft Entra user discovery timed out after ${durationLabel(discoveryTimeoutMs)}.`,
+                (signal) => microsoft.listAllUsers({ signal, onPage: async (progress) => checkpointRunTarget(targetRun, "discovery", `Microsoft Entra page ${progress.pageNumber}: ${progress.accumulatedItems} loaded.`) }));
+              const active = users.filter(isMicrosoftActive); const matched: MicrosoftMatchedUser[] = []; const discoveredAt = new Date().toISOString();
+              const discoveries = active.map((user) => {
+                const email = microsoftEmail(user); const match = directorySchoolboxMatch(microsoftMatchEmails(user), schoolboxByEmail);
+                if (match) matched.push({ microsoft: user, schoolbox: match.schoolbox, schoolboxEmail: match.matchedEmail });
+                return { target, targetUserId: user.id, targetEmail: email, schoolboxUserId: match?.schoolbox.id ?? null,
+                  schoolboxEmail: match?.matchedEmail ?? null, displayName: microsoftDisplayName(user) || (match ? schoolboxDisplayName(match.schoolbox) : null),
+                  role: match ? schoolboxRole(match.schoolbox) : null, status: match ? "pending" : "unmatched",
+                  lastSyncAt: null, lastError: match ? null : "No active Schoolbox user has a matching Microsoft 365 address.", eventCount: 0, updatedAt: discoveredAt };
+              });
+              targetRun.usersDiscovered = active.length; targetRun.usersMatched = matched.length;
+              const selection = await discoverUserMappings(discoveries, config.syncNewMicrosoftUsersByDefault, target);
+              const selected = matched.filter((match) => selection.get(match.microsoft.id)); targetRun.usersSelected = selected.length;
+              await checkpointRunTarget(targetRun, "user_sync", `${selected.length} Microsoft 365 account(s) queued.`);
+              await processInPool(selected, config.concurrency, async (match) => {
+                const deadline = createDeadlineSignal(runSignal, userSyncTimeoutMs, `Microsoft 365 user synchronization timed out after ${durationLabel(userSyncTimeoutMs)}.`);
+                try { await syncMicrosoftUser(match, run, targetRun, schoolbox, microsoft, { pastDays: config.pastDays, futureDays: config.futureDays, timezone: config.timezone, syncPolicy: config.microsoftSyncPolicy, signal: deadline.signal }); }
+                finally { deadline.dispose(); }
+                await checkpointRunTarget(targetRun, "user_sync", `${targetRun.usersSynced + targetRun.errors} of ${selected.length} Microsoft 365 account(s) processed.`);
+              }, runSignal);
+            }
+            targetRun.status = targetRun.errors ? "completed_with_errors" : "completed"; targetRun.phase = "completed";
+            targetRun.message = `${targetRun.usersSynced} account(s) synced; ${targetRun.usersMatched - targetRun.usersSelected} matched account(s) paused.`;
+          } catch (error) {
+            targetRun.status = "failed"; targetRun.phase = "failed"; targetRun.errors += 1; targetRun.message = syncErrorMessage(error, runSignal);
+          } finally { targetRun.completedAt = new Date().toISOString(); await finishRunTarget(targetRun); }
+          return targetRun;
+        }));
+        for (const targetRun of targetResults) {
+          run.usersDiscovered += targetRun.usersDiscovered; run.usersMatched += targetRun.usersMatched;
+          run.usersSynced += targetRun.target === "microsoft" ? targetRun.usersSynced : 0;
+          run.eventsCreated += targetRun.target === "microsoft" ? targetRun.eventsCreated : 0;
+          run.eventsUpdated += targetRun.target === "microsoft" ? targetRun.eventsUpdated : 0;
+          run.eventsDeleted += targetRun.target === "microsoft" ? targetRun.eventsDeleted : 0;
+          run.eventsUnchanged += targetRun.target === "microsoft" ? targetRun.eventsUnchanged : 0;
+          run.errors += targetRun.target === "microsoft" ? targetRun.errors : targetRun.status === "failed" ? 1 : 0;
+        }
         throwIfAborted(runSignal);
         await checkpointRun(run, "finalizing", "Finalizing run counters and audit status.");
         run.status = run.errors > 0 ? "completed_with_errors" : "completed";
-        const paused = matched.length - selected.length;
+        const paused = targetResults.reduce((sum, target) => sum + target.usersMatched - target.usersSelected, 0);
         run.message = run.errors > 0
-          ? `${run.errors} user syncs require attention; ${paused} matched user(s) were paused.`
-          : `Organization sync completed; ${run.usersSynced} user(s) synced and ${paused} matched user(s) paused.`;
+          ? `${run.errors} target/user sync(s) require attention; ${paused} matched target account(s) were paused.`
+          : `Organization sync completed across ${enabledTargets.length} target(s); ${run.usersSynced} target account(s) synced and ${paused} paused.`;
       },
     );
   } catch (error) {
