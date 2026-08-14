@@ -261,8 +261,13 @@ function isGoogleActive(user: GoogleDirectoryUser): boolean {
   return !record.suspended && !record.archived;
 }
 
-function microsoftEmail(user: MicrosoftGraphUser): string {
-  return normalizedEmail(user.mail || user.userPrincipalName);
+function microsoftPrimarySmtp(user: MicrosoftGraphUser): string {
+  const primary = user.proxyAddresses?.find((address) => address.startsWith("SMTP:"));
+  return normalizedEmail(primary?.slice("SMTP:".length));
+}
+
+export function microsoftEmail(user: MicrosoftGraphUser): string {
+  return microsoftPrimarySmtp(user) || normalizedEmail(user.mail || user.userPrincipalName);
 }
 
 function googleMatchEmails(user: GoogleDirectoryUser): string[] {
@@ -275,6 +280,7 @@ function googleMatchEmails(user: GoogleDirectoryUser): string[] {
 
 function microsoftMatchEmails(user: MicrosoftGraphUser): string[] {
   return [...new Set([
+    microsoftPrimarySmtp(user),
     user.mail ?? "",
     user.userPrincipalName ?? "",
     ...(user.proxyAddresses ?? []).map((address) => address.replace(/^smtp:/i, "")),
