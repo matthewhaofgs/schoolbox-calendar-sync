@@ -32,7 +32,7 @@ Rotate the single-tenant Entra application credential before its configured expi
 3. Run the Microsoft 365 connection diagnostic with a known licensed pilot mailbox. A successful probe records the replacement credential as verified; re-enable the target and run a Microsoft-only pilot sync.
 4. After both checks succeed, delete the old client secret in Entra.
 
-If the application client ID, tenant ID, redirect URI, or Graph application permissions change, update the Relay connection and repeat the interactive admin-consent flow. The exact redirect URI remains `${APP_ORIGIN}/api/auth/microsoft/admin-consent/callback`.
+If the application client ID, tenant ID, redirect URI, or Graph application permissions change, update the Relay connection and repeat the interactive admin-consent flow. Register the callback under the Entra **Web** platform—not SPA or public client/native—and leave public client flows disabled. The exact redirect URI remains `${APP_ORIGIN}/api/auth/microsoft/admin-consent/callback`.
 
 ## Connection reconfiguration
 

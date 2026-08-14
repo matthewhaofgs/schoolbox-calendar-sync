@@ -170,7 +170,7 @@ Microsoft 365 synchronization uses a confidential, single-tenant Entra applicati
 ### Entra application
 
 1. In **Microsoft Entra admin center > App registrations**, create an application for **Accounts in this organizational directory only**.
-2. Add a **Web** redirect URI using the exact Relay origin:
+2. For the redirect URI platform/application type, select **Web**. Do not select **Single-page application** or **Mobile and desktop applications / public client (native)**, and leave public client flows disabled. Add the exact Relay callback URI:
 
    ```text
    ${APP_ORIGIN}/api/auth/microsoft/admin-consent/callback
