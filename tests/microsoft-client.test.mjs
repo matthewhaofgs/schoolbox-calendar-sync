@@ -344,6 +344,61 @@ test("connection write verification requires an explicit target mailbox", async 
   assert.equal(requestCount, 0, "no arbitrary directory mailbox should be probed");
 });
 
+test("connection test explains missing Graph application permissions", async () => {
+  const client = new MicrosoftGraphClient(credentials, {
+    fetch: async (input) => {
+      const url = new URL(String(input));
+      if (url.hostname === "login.microsoftonline.com") return tokenResponse();
+      return Response.json({
+        error: {
+          code: "Authorization_RequestDenied",
+          message: "private.person@example.test is not authorized",
+        },
+      }, { status: 403 });
+    },
+  });
+
+  await assert.rejects(
+    client.testConnection({ targetUserId: "selected-mailbox-id" }),
+    (error) => {
+      assert.equal(error instanceof MicrosoftConfigurationError, true);
+      assert.match(error.message, /User\.Read\.All/);
+      assert.match(error.message, /Calendars\.ReadWrite/);
+      assert.match(error.message, /Application permissions \(not Delegated permissions\)/);
+      assert.match(error.message, /Grant admin consent/);
+      assert.equal(error.message.includes("private.person"), false);
+      assert.equal(error.message.includes("selected-mailbox-id"), false);
+      return true;
+    },
+  );
+});
+
+test("connection test distinguishes mailbox policy denial from directory permission denial", async () => {
+  const client = new MicrosoftGraphClient(credentials, {
+    fetch: async (input) => {
+      const url = new URL(String(input));
+      if (url.hostname === "login.microsoftonline.com") return tokenResponse();
+      if (url.pathname === "/v1.0/users") {
+        return Response.json({ value: [{ id: "directory-sample" }] });
+      }
+      return Response.json({
+        error: { code: "ErrorAccessDenied", message: "mailbox policy denied access" },
+      }, { status: 403 });
+    },
+  });
+
+  await assert.rejects(
+    client.testConnection({ targetUserId: "selected-mailbox-id" }),
+    (error) => {
+      assert.equal(error instanceof MicrosoftConfigurationError, true);
+      assert.match(error.message, /Calendars\.ReadWrite/);
+      assert.match(error.message, /Exchange Application RBAC or Application Access Policy/);
+      assert.equal(error.message.includes("selected-mailbox-id"), false);
+      return true;
+    },
+  );
+});
+
 test("connection test surfaces actionable privacy-safe temporary calendar cleanup failures", async () => {
   const controller = new AbortController();
   const requests = [];

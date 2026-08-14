@@ -493,6 +493,10 @@ export function isMicrosoftGraphNotFound(
   );
 }
 
+function isMicrosoftGraphForbidden(error: unknown): error is MicrosoftGraphError {
+  return error instanceof MicrosoftGraphError && error.status === 403;
+}
+
 export function isMicrosoftGraphConflict(
   error: unknown,
 ): error is MicrosoftGraphError {
@@ -1072,7 +1076,17 @@ export class MicrosoftGraphClient {
       );
     }
     const directoryUrl = this.usersPageUrl({ top: 1, signal: options.signal });
-    const page = await this.listUsersPage(directoryUrl, options.signal);
+    let page: MicrosoftGraphCollection<MicrosoftGraphUser>;
+    try {
+      page = await this.listUsersPage(directoryUrl, options.signal);
+    } catch (error) {
+      if (isMicrosoftGraphForbidden(error)) {
+        throw new MicrosoftConfigurationError(
+          "Microsoft Graph denied Entra directory discovery. In the Entra app registration, open API permissions and add User.Read.All and Calendars.ReadWrite under Microsoft Graph → Application permissions (not Delegated permissions). Select Grant admin consent for your organisation and confirm both rows show Granted before trying again. Relay cannot add missing API permissions to the app registration.",
+        );
+      }
+      throw error;
+    }
     const sampleUsers = page.value ?? [];
     const targetUserId = requestedTargetUserId || sampleUsers[0]?.id;
     if (!targetUserId) {
@@ -1080,16 +1094,36 @@ export class MicrosoftGraphClient {
         "No Entra user is available for the mailbox calendar test.",
       );
     }
-    const calendar = await this.getPrimaryCalendar(targetUserId, {
-      signal: options.signal,
-    });
+    let calendar: MicrosoftCalendar;
+    try {
+      calendar = await this.getPrimaryCalendar(targetUserId, {
+        signal: options.signal,
+      });
+    } catch (error) {
+      if (isMicrosoftGraphForbidden(error)) {
+        throw new MicrosoftConfigurationError(
+          "Microsoft Graph authenticated but denied calendar access to the test mailbox. Confirm Calendars.ReadWrite is an Application permission with tenant admin consent. If it is already granted, ensure the mailbox is licensed for Exchange Online and is included in any Exchange Application RBAC or Application Access Policy scope.",
+        );
+      }
+      throw error;
+    }
     let secondaryCalendarManagement = false;
     if (verifyWriteAccess) {
       let temporaryCalendarId: string | undefined;
       try {
-        const created = await this.createCalendar(targetUserId, {
-          name: "Relay connection test - safe to delete",
-        }, { signal: options.signal });
+        let created: MicrosoftCalendar;
+        try {
+          created = await this.createCalendar(targetUserId, {
+            name: "Relay connection test - safe to delete",
+          }, { signal: options.signal });
+        } catch (error) {
+          if (isMicrosoftGraphForbidden(error)) {
+            throw new MicrosoftConfigurationError(
+              "Microsoft Graph can read the test mailbox but cannot create calendars. Confirm Calendars.ReadWrite is an Application permission with tenant admin consent, and ensure any Exchange Application RBAC or Application Access Policy includes this mailbox.",
+            );
+          }
+          throw error;
+        }
         if (!created.id?.trim()) {
           throw new MicrosoftGraphError(
             "Microsoft Graph created a connection-test calendar without returning its identifier.",
