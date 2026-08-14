@@ -223,6 +223,37 @@ test("paused unmatched accounts remain informational in aggregate counts", async
   assert.equal(snapshot.counts.errors, 0);
 });
 
+test("Microsoft discovery retains duplicate mail values by stable Graph ID", async () => {
+  const updatedAt = new Date().toISOString();
+  const duplicate = (targetUserId) => ({
+    target: "microsoft",
+    targetUserId,
+    targetEmail: "shared-address@example.edu",
+    schoolboxUserId: null,
+    schoolboxEmail: null,
+    displayName: `Synthetic ${targetUserId}`,
+    role: null,
+    status: "unmatched",
+    lastSyncAt: null,
+    lastError: "A matching address is ambiguous.",
+    eventCount: 0,
+    updatedAt,
+  });
+
+  const selection = await storage.discoverUserMappings(
+    [duplicate("entra-object-a"), duplicate("entra-object-b")],
+    true,
+    "microsoft",
+  );
+  assert.deepEqual([...selection.values()], [false, false]);
+
+  const mappings = await storage.listUserMappings(undefined, false, "microsoft");
+  assert.equal(mappings.length, 2);
+  assert.deepEqual(mappings.map((mapping) => mapping.targetUserId).sort(), ["entra-object-a", "entra-object-b"]);
+  assert.ok(mappings.every((mapping) => mapping.targetEmail === "shared-address@example.edu"));
+  assert.ok(mappings.every((mapping) => mapping.syncEnabled === false));
+});
+
 after(() => {
   db().close();
   rmSync(temporary, { recursive: true, force: true });

@@ -556,7 +556,7 @@ const schemaStatements = [
   "CREATE INDEX IF NOT EXISTS sync_runs_started_idx ON sync_runs (started_at DESC)",
   "CREATE INDEX IF NOT EXISTS sync_run_users_status_idx ON sync_run_users (run_id, status, google_email)",
   "CREATE INDEX IF NOT EXISTS sync_run_events_user_idx ON sync_run_events (run_id, google_user_id, action, source_start)",
-  "CREATE UNIQUE INDEX IF NOT EXISTS target_user_mappings_active_email_idx ON target_user_mappings (target, target_email COLLATE NOCASE) WHERE directory_active = 1",
+  "CREATE UNIQUE INDEX IF NOT EXISTS target_user_mappings_active_email_idx ON target_user_mappings (target, target_email COLLATE NOCASE) WHERE target = 'google' AND directory_active = 1",
   "CREATE INDEX IF NOT EXISTS target_event_mappings_seen_idx ON target_event_mappings (target, target_user_id, last_seen_run_id)",
   "CREATE INDEX IF NOT EXISTS sync_run_target_users_status_idx ON sync_run_target_users (run_id, target, status, target_email)",
   "CREATE INDEX IF NOT EXISTS sync_run_target_events_user_idx ON sync_run_target_events (run_id, target, target_user_id, action, source_start)",
@@ -570,6 +570,23 @@ export async function ensureSchema(): Promise<void> {
   binding.transaction(() => {
     for (const statement of schemaStatements) binding.prepare(statement).run();
   });
+  // Google Workspace guarantees a single active account for an address, and
+  // Relay relies on that invariant when addresses are renamed or reassigned.
+  // Entra can legitimately return multiple member objects with the same mail
+  // value (for example, an account and a mail-enabled directory object). Those
+  // rows are retained by stable Graph ID and resolved as ambiguous during
+  // matching instead of aborting the entire Microsoft discovery transaction.
+  const targetEmailIndex = binding.prepare(`SELECT sql FROM sqlite_master
+    WHERE type = 'index' AND name = 'target_user_mappings_active_email_idx'`)
+    .first<{ sql: string | null }>();
+  if (!targetEmailIndex?.sql || !/target\s*=\s*'google'/i.test(targetEmailIndex.sql)) {
+    binding.transaction(() => {
+      binding.prepare("DROP INDEX IF EXISTS target_user_mappings_active_email_idx").run();
+      binding.prepare(`CREATE UNIQUE INDEX target_user_mappings_active_email_idx
+        ON target_user_mappings (target, target_email COLLATE NOCASE)
+        WHERE target = 'google' AND directory_active = 1`).run();
+    });
+  }
   const runColumns = binding.prepare("PRAGMA table_info(sync_runs)").all<{ name: string }>().results;
   if (!runColumns.some((column) => column.name === "heartbeat_at")) {
     binding.prepare("ALTER TABLE sync_runs ADD COLUMN heartbeat_at TEXT").run();

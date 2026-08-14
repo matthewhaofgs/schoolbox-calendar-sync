@@ -281,6 +281,28 @@ function microsoftMatchEmails(user: MicrosoftGraphUser): string[] {
   ].map(normalizedEmail).filter(Boolean))];
 }
 
+/**
+ * Returns only addresses owned by one active Entra object. Microsoft permits
+ * duplicate `mail` values on some directory objects; silently choosing one of
+ * those objects could send a person's Schoolbox data to the wrong mailbox.
+ * Stable Graph IDs still let Relay retain every discovered object for admins.
+ */
+export function indexUniqueMicrosoftEmails(users: MicrosoftGraphUser[]): Map<string, string> {
+  const owners = new Map<string, Set<string>>();
+  for (const user of users) {
+    for (const email of microsoftMatchEmails(user)) {
+      const ids = owners.get(email) ?? new Set<string>();
+      ids.add(user.id);
+      owners.set(email, ids);
+    }
+  }
+  const unique = new Map<string, string>();
+  for (const [email, ids] of owners) {
+    if (ids.size === 1) unique.set(email, ids.values().next().value!);
+  }
+  return unique;
+}
+
 function directorySchoolboxMatch(
   emails: string[],
   schoolboxByEmail: Map<string, SchoolboxUser>,
@@ -1726,13 +1748,22 @@ export async function runFullSync(
                 `Microsoft Entra user discovery timed out after ${durationLabel(discoveryTimeoutMs)}.`,
                 (signal) => microsoft.listAllUsers({ signal, onPage: async (progress) => checkpointRunTarget(targetRun, "discovery", `Microsoft Entra page ${progress.pageNumber}: ${progress.accumulatedItems} loaded.`) }));
               const active = users.filter(isMicrosoftActive); const matched: MicrosoftMatchedUser[] = []; const discoveredAt = new Date().toISOString();
+              const uniqueMicrosoftEmails = indexUniqueMicrosoftEmails(active);
               const discoveries = active.map((user) => {
-                const email = microsoftEmail(user); const match = directorySchoolboxMatch(microsoftMatchEmails(user), schoolboxByEmail);
+                const email = microsoftEmail(user);
+                const candidateEmails = microsoftMatchEmails(user);
+                const uniqueCandidateEmails = candidateEmails.filter((candidate) => uniqueMicrosoftEmails.get(candidate) === user.id);
+                const match = directorySchoolboxMatch(uniqueCandidateEmails, schoolboxByEmail);
+                const hasAmbiguousSchoolboxMatch = !match && candidateEmails.some((candidate) =>
+                  schoolboxByEmail.has(candidate) && uniqueMicrosoftEmails.get(candidate) !== user.id);
                 if (match) matched.push({ microsoft: user, schoolbox: match.schoolbox, schoolboxEmail: match.matchedEmail });
                 return { target, targetUserId: user.id, targetEmail: email, schoolboxUserId: match?.schoolbox.id ?? null,
                   schoolboxEmail: match?.matchedEmail ?? null, displayName: microsoftDisplayName(user) || (match ? schoolboxDisplayName(match.schoolbox) : null),
                   role: match ? schoolboxRole(match.schoolbox) : null, status: match ? "pending" : "unmatched",
-                  lastSyncAt: null, lastError: match ? null : "No active Schoolbox user has a matching Microsoft 365 address.", eventCount: 0, updatedAt: discoveredAt };
+                  lastSyncAt: null, lastError: match ? null : hasAmbiguousSchoolboxMatch
+                    ? "A matching address is shared by multiple active Microsoft 365 accounts, so Relay left this account unmatched."
+                    : "No active Schoolbox user has a unique matching Microsoft 365 address.",
+                  eventCount: 0, updatedAt: discoveredAt };
               });
               targetRun.usersDiscovered = active.length; targetRun.usersMatched = matched.length;
               const selection = await discoverUserMappings(discoveries, config.syncNewMicrosoftUsersByDefault, target);
