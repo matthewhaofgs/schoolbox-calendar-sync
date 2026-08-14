@@ -6,6 +6,8 @@ Google access uses a service account with Domain-Wide Delegation. Microsoft 365 
 
 Relay is an independent project and is not affiliated with or endorsed by Schoolbox, Google, or Microsoft.
 
+For a new deployment, follow the [command-by-command Ubuntu installation guide](docs/installation.md). It starts with a fresh server and covers Docker, private environment secrets, loopback-only application binding, nginx TLS, firewall rules, the local administrator, provider setup, and a safe pilot.
+
 ## Screenshots
 
 Screenshots use an isolated database containing fictional `example.edu` sample data. Each image links to its full-resolution source.
@@ -80,6 +82,8 @@ Relay supports one application replica per SQLite database. The Node server list
 - Google Web OAuth client with an Internal audience for IT sign-in; this controls Relay administrator access and is independent of the selected calendar targets
 
 ## Deployment
+
+The complete first-time procedure is in the [Ubuntu installation guide](docs/installation.md). The shorter commands below are intended for administrators already familiar with Docker-based Linux deployments.
 
 ### Network
 
