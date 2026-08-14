@@ -34,6 +34,8 @@ Rotate the single-tenant Entra application credential before its configured expi
 
 If the application client ID, tenant ID, redirect URI, or Graph application permissions change, update the Relay connection and repeat the interactive admin-consent flow. Register the callback under the Entra **Web** platform—not SPA or public client/native—and leave public client flows disabled. The exact redirect URI remains `${APP_ORIGIN}/api/auth/microsoft/admin-consent/callback`.
 
+The complete Entra registration, permissions, pilot, address-refresh, and error-resolution procedures are documented in the [Microsoft 365 setup and troubleshooting guide](microsoft-365.md).
+
 ## Connection reconfiguration
 
 Use the provider-specific guides under **Connections** for connection changes. Schoolbox, Google Workspace, and Microsoft 365 have independent saved, verified, and completed states. A connection change invalidates and pauses only the affected calendar target; it does not rewrite the other provider's credentials or completion state.
@@ -44,6 +46,8 @@ The safe sequence for a changed target is:
 2. Run the guide's connection diagnostic against the saved version.
 3. Complete the target guide and choose whether to activate delivery.
 4. Run a target-only pilot sync before widening user coverage.
+
+For a Microsoft mail-address change, no Relay remapping command is required. The next Microsoft directory discovery refreshes the existing stable Entra object by ID, updates its current primary SMTP address and aliases, and recalculates the Schoolbox match. Allow for Microsoft 365 directory propagation, run a Microsoft-only sync, and refresh **People > Microsoft 365**. If the account becomes unmatched, resolve the active Schoolbox email ambiguity before re-enabling it.
 
 ## Backup
 

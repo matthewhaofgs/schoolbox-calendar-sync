@@ -16,11 +16,13 @@ Screenshots use an isolated database containing fictional `example.edu` sample d
 
 ### Administration workflow
 
-| Sign in | Setup complete |
+| Sign in | Independent connection setup |
 | --- | --- |
-| [![Relay administrator sign-in](docs/screenshots/login.png)](docs/screenshots/login.png) | [![Relay setup completion summary](docs/screenshots/setup-complete.png)](docs/screenshots/setup-complete.png) |
-| **People and sync coverage** | **Runs and troubleshooting** |
-| [![Relay people and sync coverage](docs/screenshots/people.png)](docs/screenshots/people.png) | [![Relay run history and diagnostic detail](docs/screenshots/runs.png)](docs/screenshots/runs.png) |
+| [![Relay administrator sign-in](docs/screenshots/login.png)](docs/screenshots/login.png) | [![Relay independent connection setup](docs/screenshots/connections.png)](docs/screenshots/connections.png) |
+| **Microsoft 365 setup guide** | **Runs and troubleshooting** |
+| [![Relay Microsoft 365 setup guide](docs/screenshots/setup-microsoft.png)](docs/screenshots/setup-microsoft.png) | [![Relay dual-target run history and diagnostic detail](docs/screenshots/runs.png)](docs/screenshots/runs.png) |
+| **Google Workspace people** | **Microsoft 365 people** |
+| [![Relay Google Workspace people and sync coverage](docs/screenshots/people-google.png)](docs/screenshots/people-google.png) | [![Relay Microsoft 365 people and sync coverage](docs/screenshots/people-microsoft.png)](docs/screenshots/people-microsoft.png) |
 | **IT access** | |
 | [![Relay Google sign-in and IT staff access](docs/screenshots/it-access.png)](docs/screenshots/it-access.png) | |
 
@@ -29,12 +31,12 @@ Screenshots use an isolated database containing fictional `example.edu` sample d
 | Schedule | New-user coverage |
 | --- | --- |
 | [![Relay sync schedule settings](docs/screenshots/settings-schedule.png)](docs/screenshots/settings-schedule.png) | [![Relay new-user coverage settings](docs/screenshots/settings-people.png)](docs/screenshots/settings-people.png) |
-| **Event rules and calendar routing** | **Event content** |
-| [![Relay event rules and per-type calendar routing](docs/screenshots/settings-event-rules.png)](docs/screenshots/settings-event-rules.png) | [![Relay event content settings](docs/screenshots/settings-event-content.png)](docs/screenshots/settings-event-content.png) |
-| **Connections** | **Reconciliation** |
-| [![Relay connected service settings](docs/screenshots/settings-connections.png)](docs/screenshots/settings-connections.png) | [![Relay reconciliation and removal settings](docs/screenshots/settings-reconciliation.png)](docs/screenshots/settings-reconciliation.png) |
-| **Advanced operations** | |
-| [![Relay advanced operation settings](docs/screenshots/settings-advanced.png)](docs/screenshots/settings-advanced.png) | |
+| **Google Calendar routing** | **Outlook Calendar routing** |
+| [![Relay Google Calendar event rules and per-type routing](docs/screenshots/settings-event-rules-google.png)](docs/screenshots/settings-event-rules-google.png) | [![Relay Outlook Calendar event rules and per-type routing](docs/screenshots/settings-event-rules-microsoft.png)](docs/screenshots/settings-event-rules-microsoft.png) |
+| **Event content** | **Connections** |
+| [![Relay Outlook event content settings](docs/screenshots/settings-event-content.png)](docs/screenshots/settings-event-content.png) | [![Relay Google and Microsoft connected service settings](docs/screenshots/settings-connections.png)](docs/screenshots/settings-connections.png) |
+| **Reconciliation** | **Advanced operations** |
+| [![Relay target-specific reconciliation and removal settings](docs/screenshots/settings-reconciliation.png)](docs/screenshots/settings-reconciliation.png) | [![Relay dual-target advanced operation settings](docs/screenshots/settings-advanced.png)](docs/screenshots/settings-advanced.png) |
 
 ## Architecture
 
@@ -188,6 +190,8 @@ Microsoft 365 synchronization uses a confidential, single-tenant Entra applicati
 4. Create a client secret under **Certificates & secrets** and record its value immediately. Microsoft displays the secret value only when it is created.
 5. In Relay, open **Connections > Microsoft 365**, enter the directory tenant ID, application client ID, client secret, and a pilot mailbox address, then complete the guided admin-consent and verification flow. The Microsoft target can be activated without configuring Google Workspace.
 
+See the [Microsoft 365 setup and troubleshooting guide](docs/microsoft-365.md) for the portal checklist, permission verification, pilot rollout, identity refresh behavior, and common Graph errors.
+
 ### Admin consent and diagnostics
 
 Use Relay's Microsoft 365 admin-consent action with a Microsoft **Privileged Role Administrator** or **Global Administrator** account. Relay sends the administrator to the tenant-specific Microsoft consent page and returns them to `/api/auth/microsoft/admin-consent/callback`. The callback validates the one-time state and returned tenant before accepting the result.
@@ -217,6 +221,7 @@ Relay can operate in Google-only, Microsoft-only, or dual-target mode. In dual-t
 ### Identity and coverage
 
 - Target users are keyed by their stable Google or Microsoft Entra ID.
+- For Microsoft 365, Relay prefers the uppercase `SMTP:` entry in `proxyAddresses` as the current primary address, then falls back to `mail` and `userPrincipalName`; aliases remain available for Schoolbox matching.
 - A unique Schoolbox primary email match takes precedence over an alternate email match.
 - Ambiguous addresses at the same match level remain unmatched.
 - Inactive Schoolbox users are excluded from matching.
